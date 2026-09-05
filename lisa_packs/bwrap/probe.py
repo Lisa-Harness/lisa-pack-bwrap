@@ -60,26 +60,35 @@ def _probe_bwrap_run(binary: str) -> bool:
 
 
 def _probe_overlay_userxattr(binary: str, probe_dir: Path) -> bool:
-    """Confirm unprivileged overlayfs (userxattr) mounts work inside bwrap."""
+    """Confirm unprivileged overlayfs (userxattr) mounts work inside bwrap.
+
+    This probe MUST mirror the real overlay argv shape (scoped RO lowerdir,
+    bound upper, bound pre-created merged mountpoint, NO workdir bound in, and
+    the same namespace flags as ``build_bwrap_argv``). A probe whose argv differs
+    from the real path can report success while the real run fails, or vice
+    versa.
+    """
     upper = probe_dir / "upper"
     work = probe_dir / "work"
     merged = probe_dir / "merged"
-    for path in (upper, work, merged):
+    lower = probe_dir / "lower"
+    for path in (upper, work, merged, lower):
         path.mkdir(parents=True, exist_ok=True)
     script = (
-        "mount -t overlay -o userxattr,lowerdir=/,"
-        f"upperdir={upper},workdir={work} overlay {merged}"
+        "mount -t overlay -o userxattr,"
+        f"lowerdir={lower},upperdir={upper},workdir={work} overlay {merged}"
     )
     try:
         proc = subprocess.run(
             [
                 binary,
-                "--unshare-all",
+                "--unshare-pid", "--unshare-uts", "--unshare-ipc",
                 "--ro-bind", "/", "/",
+                "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                "--ro-bind", str(lower), str(lower),
                 "--bind", str(upper), str(upper),
-                "--bind", str(work), str(work),
                 "--bind", str(merged), str(merged),
-                "--die-with-parent",
+                "--die-with-parent", "--new-session",
                 "--",
                 "/bin/sh", "-c", script,
             ],

@@ -58,7 +58,7 @@ def layer_size_bytes(layer_path: Path) -> int:
 
 
 def list_layers(layers_dir: Path) -> list[LayerInfo]:
-    """Enumerate layers under the layers root, newest id first."""
+    """Enumerate layers under the layers root, sorted ascending by layer id."""
     if not layers_dir.is_dir():
         return []
     layers: list[LayerInfo] = []

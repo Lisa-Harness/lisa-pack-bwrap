@@ -1,9 +1,12 @@
 """Bubblewrap sandbox tool for Lisa.
 
-Runs an argv inside a bubblewrap namespace with a read-only root FS. Overlayfs
-layers are the default backend and are transparent to the model: mutations are
-captured per session unless overlayfs is unavailable (then tmpfs, degradation
-reported explicitly). The model never names overlayfs, layers, or mounts.
+Runs an argv inside a bubblewrap namespace with a read-only root FS. The
+DEFAULT backend is tmpfs: mutations go to an ephemeral tmpfs and are discarded
+when the namespace exits. overlayfs is an OPT-IN capture backend - it runs only
+when the caller explicitly asks to capture persistence (via ``persist=True`` or
+an explicit ``layer_id``) AND unprivileged overlayfs is available; otherwise the
+request degrades to tmpfs explicitly (never silently). The model never names
+overlayfs, layers, or mounts.
 """
 
 from __future__ import annotations
@@ -33,16 +36,23 @@ class Parameters(BaseModel):
     timeout_seconds: int = Field(default=60, ge=1, le=600)
     persist: bool = Field(
         default=False,
-        description="Keep the overlay layer after this run (default: per-session).",
+        description=(
+            "Opt in to capturing mutations in an overlayfs layer kept after "
+            "this run. Default off: writes go to ephemeral tmpfs and are "
+            "discarded. Requires unprivileged overlayfs on the host."
+        ),
     )
     layer_id: str = Field(
         default="",
-        description="Explicit overlay layer id (empty = transparent per-session layer).",
+        description=(
+            "Explicit overlay layer id (opt in to overlayfs capture). Empty = "
+            "no capture; tmpfs unless persist=True."
+        ),
     )
 
 
 async def execute(ctx: ToolExecutionContext) -> ToolResult:
-    """Run argv inside a bubblewrap sandbox."""
+    """Run argv inside a bubblewrap sandbox (tmpfs by default; overlay opt-in)."""
     try:
         params = Parameters.model_validate(ctx.parameters)
     except Exception as exc:
@@ -66,6 +76,12 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         )
 
     session_key = _session_key(ctx)
+
+    # Overlayfs is opt-in: only build a layer when the caller explicitly asked
+    # to capture mutations (persist=True or an explicit layer_id). Otherwise
+    # mutations go to ephemeral tmpfs and are discarded - the default.
+    wants_overlay = bool(params.layer_id) or params.persist
+
     try:
         layer_id = (
             sanitize_layer_id(params.layer_id)
@@ -75,16 +91,18 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
     except ValueError as exc:
         return ToolResult(tool_id=TOOL_ID, error=str(exc))
 
-    degraded_overlay = not caps.can_overlay
-    if degraded_overlay:
-        backend = TmpfsBackend()
-        child_argv = params.argv
-        bind_args: list[str] = []
-    else:
-        overlay = OverlayBackend(layers_dir, layer_id)
+    overlay_requested_but_unavailable = wants_overlay and not caps.can_overlay
+    use_overlay = wants_overlay and caps.can_overlay
+
+    if use_overlay:
+        overlay = OverlayBackend(layers_dir, layer_id, bind_target=_bind_target(ctx))
         backend = overlay
-        bind_args = overlay.bind_args()
+        bind_args: list[str] = overlay.bind_args()
         child_argv = overlay.overlay_mount_script(list(params.argv))
+    else:
+        backend = TmpfsBackend()
+        bind_args = []
+        child_argv = params.argv
 
     try:
         argv = build_bwrap_argv(
@@ -102,23 +120,29 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
     except Exception as exc:
         return ToolResult(tool_id=TOOL_ID, error=f"bwrap_run failed: {exc}")
 
-    persistence = "ephemeral" if not caps.can_overlay else ("persistent" if params.persist else "session")
+    if use_overlay:
+        persistence = "persistent" if params.persist else "session"
+    else:
+        persistence = "ephemeral"
+
     output_json = {
         "return_code": result.return_code,
         "stderr": result.stderr,
         "sandboxed": True,
         "backend": backend.name,
-        "layer_id": layer_id,
         "persistence": persistence,
         "timed_out": result.timed_out,
         "truncated": result.output_truncated,
     }
-    if degraded_overlay:
+    if use_overlay:
+        output_json["layer_id"] = layer_id
+    if overlay_requested_but_unavailable:
         output_json["degraded"] = True
         output_json["missing"] = list(caps.missing)
         output_json["note"] = (
-            "overlayfs unavailable: mutations captured only in ephemeral tmpfs "
-            "and discarded on exit. See sandboxing_degraded.md."
+            "overlayfs capture was requested but unprivileged overlayfs is "
+            "unavailable on this host; mutations went to ephemeral tmpfs and "
+            "were discarded on exit. See sandboxing_degraded.md."
         )
 
     return ToolResult(
@@ -132,6 +156,17 @@ def _resolve_layers_dir(ctx: ToolExecutionContext) -> Path:
     """Resolve layer storage under the host-injected data dir."""
     base = Path(ctx.data_dir) if ctx.data_dir else Path.home() / ".lisa"
     return base / "layers"
+
+
+def _bind_target(ctx: ToolExecutionContext) -> Path:
+    """The scoped subtree overlaid when capture is requested.
+
+    Overlayfs lowerdir BCP: a stable, read-only subtree, never the whole live
+    root ``/``. We scope capture to the host-injected data dir (falling back to
+    the user's home) so writes the sandbox believes it makes land in the layer
+    and stay inspectable - not meaningless shadows of system paths.
+    """
+    return Path(ctx.data_dir) if ctx.data_dir else Path.home()
 
 
 def _session_key(ctx: ToolExecutionContext) -> str:

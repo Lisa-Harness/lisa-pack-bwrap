@@ -56,28 +56,75 @@ async def test_invalid_layer_id_rejected(monkeypatch, tmp_path: Path) -> None:
     assert "Invalid layer_id" in result.error or "layer_id" in result.error
 
 
+class _Result:
+    return_code = 0
+    stdout = "ok\n"
+    stderr = ""
+    timed_out = False
+    output_truncated = False
+
+
+def _fake_run_process(argv, *, timeout_seconds, max_output_bytes, log_path=None):
+    async def _run():
+        return _Result()
+
+    return _run()
+
+
 @pytest.mark.asyncio
-async def test_overlay_unavailable_reports_degraded(monkeypatch, tmp_path: Path) -> None:
+async def test_default_backend_is_tmpfs_not_overlay(monkeypatch, tmp_path: Path) -> None:
+    """With no persist/layer_id, tmpfs is used even when overlay is available."""
+    class _Caps:
+        available = True
+        can_overlay = True  # overlay IS available, but must not be default
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    monkeypatch.setattr(bwrap_run, "run_process", _fake_run_process)
+    ctx = _ctx(data_dir=str(tmp_path), parameters={"argv": ["echo", "hi"]})
+    result = await bwrap_run.execute(ctx)
+    assert result.error == ""
+    assert result.output_json["backend"] == "tmpfs"
+    assert result.output_json["persistence"] == "ephemeral"
+    # No layer is created when not requested.
+    assert "layer_id" not in result.output_json
+    assert "degraded" not in result.output_json
+
+
+@pytest.mark.asyncio
+async def test_overlay_opt_in_when_available(monkeypatch, tmp_path: Path) -> None:
+    """persist=True with overlay available uses the overlay backend."""
+    class _Caps:
+        available = True
+        can_overlay = True
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    monkeypatch.setattr(bwrap_run, "run_process", _fake_run_process)
+    ctx = _ctx(data_dir=str(tmp_path), parameters={"argv": ["true"], "persist": True})
+    result = await bwrap_run.execute(ctx)
+    assert result.error == ""
+    assert result.output_json["backend"] == "overlay"
+    assert result.output_json["persistence"] == "persistent"
+    assert result.output_json["layer_id"]
+
+
+@pytest.mark.asyncio
+async def test_overlay_requested_but_unavailable_reports_degraded(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Asking for overlay on a host without it degrades explicitly to tmpfs."""
     class _Caps:
         available = True
         can_overlay = False
         bwrap_path = "/usr/bin/bwrap"
         missing = ("unprivileged overlayfs (userxattr) mounts unavailable",)
 
-    class _Result:
-        return_code = 0
-        stdout = "ok\n"
-        stderr = ""
-        timed_out = False
-        output_truncated = False
-
     monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
-
-    async def _fake_run_process(argv, *, timeout_seconds, max_output_bytes, log_path=None):
-        return _Result()
-
     monkeypatch.setattr(bwrap_run, "run_process", _fake_run_process)
-    ctx = _ctx(data_dir=str(tmp_path))
+    ctx = _ctx(data_dir=str(tmp_path), parameters={"argv": ["true"], "persist": True})
     result = await bwrap_run.execute(ctx)
     assert result.error == ""
     assert result.output_json["sandboxed"] is True
