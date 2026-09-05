@@ -1,0 +1,7 @@
+tool_id: bwrap_run
+pack_id: lisa-pack-bwrap
+module_path: lisa_packs.bwrap.tools.bwrap_run.bwrap_run
+description: "Run an argv inside a bubblewrap sandbox with read-only root FS, optional network isolation, and a transparent overlayfs layer that captures mutations. Approval-gated indirectly: bash_run (approval_required) is the user-facing approval boundary and composes through this tool as its sandbox backend."
+effect: execute
+approval_required: false
+exportable: true

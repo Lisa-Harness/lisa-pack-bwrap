@@ -1,0 +1,87 @@
+"""Unit tests for the bwrap_run handler (subprocess + probe mocked)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from kernel.models import ToolExecutionContext
+
+from lisa_packs.bwrap.tools.bwrap_run import bwrap_run
+
+
+def _ctx(**overrides) -> ToolExecutionContext:
+    base = dict(
+        tool_id="bwrap_run",
+        workspace_id="ws",
+        user_slug="u",
+        surface_id="surf",
+        session_plan_digest="digest",
+        parameters={"argv": ["echo", "hi"]},
+        data_dir="",
+    )
+    base.update(overrides)
+    return ToolExecutionContext(**base)
+
+
+@pytest.mark.asyncio
+async def test_missing_bwrap_returns_sandboxed_false(monkeypatch, tmp_path: Path) -> None:
+    class _Caps:
+        available = False
+        can_overlay = False
+        bwrap_path = None
+        missing = ("bubblewrap (bwrap) binary not found on PATH",)
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    ctx = _ctx(data_dir=str(tmp_path))
+    result = await bwrap_run.execute(ctx)
+    assert result.error
+    assert "bubblewrap" in result.error
+    assert result.output_json["sandboxed"] is False
+    assert result.output_json["missing"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_layer_id_rejected(monkeypatch, tmp_path: Path) -> None:
+    class _Caps:
+        available = True
+        can_overlay = True
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    ctx = _ctx(data_dir=str(tmp_path), parameters={"argv": ["true"], "layer_id": "../escape"})
+    result = await bwrap_run.execute(ctx)
+    assert "Invalid layer_id" in result.error or "layer_id" in result.error
+
+
+@pytest.mark.asyncio
+async def test_overlay_unavailable_reports_degraded(monkeypatch, tmp_path: Path) -> None:
+    class _Caps:
+        available = True
+        can_overlay = False
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ("unprivileged overlayfs (userxattr) mounts unavailable",)
+
+    class _Result:
+        return_code = 0
+        stdout = "ok\n"
+        stderr = ""
+        timed_out = False
+        output_truncated = False
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+
+    async def _fake_run_process(argv, *, timeout_seconds, max_output_bytes, log_path=None):
+        return _Result()
+
+    monkeypatch.setattr(bwrap_run, "run_process", _fake_run_process)
+    ctx = _ctx(data_dir=str(tmp_path))
+    result = await bwrap_run.execute(ctx)
+    assert result.error == ""
+    assert result.output_json["sandboxed"] is True
+    assert result.output_json["backend"] == "tmpfs"
+    assert result.output_json["persistence"] == "ephemeral"
+    assert result.output_json["degraded"] is True
+    assert "missing" in result.output_json

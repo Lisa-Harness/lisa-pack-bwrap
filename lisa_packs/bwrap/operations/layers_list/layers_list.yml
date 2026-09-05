@@ -1,0 +1,5 @@
+operation_id: layers_list
+pack_id: lisa-pack-bwrap
+module_path: lisa_packs.bwrap.operations.layers_list.layers_list
+description: "List bubblewrap overlayfs layers (id, path, size) so the user/model can inspect sandbox-captured state."
+effect: read

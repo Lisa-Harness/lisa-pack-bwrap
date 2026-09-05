@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lisa_packs*", "lisa_packs.bwrap*"]
+
+[tool.setuptools.package-data]
+"lisa_packs" = ["*"]
+"lisa_packs.bwrap" = ["tools/**/*.yml", "operations/**/*.yml", "content/**/*.md"]
+
+[project]
+name = "lisa-pack-bwrap"
+version = "0.1.0"
+description = "Bubblewrap sandbox capability for Lisa - namespace isolation with transparent overlayfs layers"
+requires-python = ">=3.11"
+dependencies = ["lisa-kernel", "lisa-sdk"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.14.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["lisa_packs/bwrap/tests"]
+markers = [
+    "live: runs a real bwrap sandbox and requires bubblewrap + unprivileged userns",
+]
+
+[project.entry-points."lisa.extensions.content_roots"]
+bwrap = "lisa_packs.bwrap:get_content_root"
