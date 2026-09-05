@@ -27,6 +27,13 @@ from lisa_packs.bwrap.process import run_process
 TOOL_ID = "bwrap_run"
 _MAX_OUTPUT_BYTES = 512_000
 
+_REMEDIATION_HINT = (
+    "Install the host package (openSUSE: 'zypper install bubblewrap', "
+    "Fedora/RHEL: 'dnf install bubblewrap', Debian/Ubuntu: 'apt install "
+    "bubblewrap', Arch: 'pacman -S bubblewrap') and ensure unprivileged user "
+    "namespaces are enabled. See sandboxing_degraded.md."
+)
+
 
 class Parameters(BaseModel):
     """Structured input for bwrap_run."""
@@ -72,7 +79,11 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
             error=(
                 "bubblewrap sandbox is not available: " + "; ".join(caps.missing)
             ),
-            output_json={"sandboxed": False, "missing": list(caps.missing)},
+            output_json={
+                "sandboxed": False,
+                "missing": list(caps.missing),
+                "note": _REMEDIATION_HINT,
+            },
         )
 
     session_key = _session_key(ctx)
@@ -142,7 +153,8 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         output_json["note"] = (
             "overlayfs capture was requested but unprivileged overlayfs is "
             "unavailable on this host; mutations went to ephemeral tmpfs and "
-            "were discarded on exit. See sandboxing_degraded.md."
+            "were discarded on exit. See sandboxing_degraded.md. "
+            + _REMEDIATION_HINT
         )
 
     return ToolResult(
