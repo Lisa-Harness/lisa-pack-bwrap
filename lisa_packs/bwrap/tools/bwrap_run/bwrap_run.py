@@ -42,6 +42,23 @@ class Parameters(BaseModel):
     argv: list[str] = Field(..., min_length=1, description="Command + args to run.")
     network: bool = Field(default=False, description="Allow network (default off).")
     timeout_seconds: int = Field(default=60, ge=1, le=600)
+    cwd: str = Field(
+        default="",
+        description=(
+            "Working directory for the command inside the sandbox. Empty "
+            "inherits the default. The path must exist in the namespace "
+            "(within capture_root or a writable_paths entry)."
+        ),
+    )
+    writable_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Extra host directories to bind read-write into the sandbox at "
+            "their real path. For callers (e.g. the coding pack) running a "
+            "bounded command in a directory OUTSIDE the capture root, such as "
+            "an owned Git worktree. Overlay capture does not overlay these."
+        ),
+    )
     persist: bool = Field(
         default=False,
         description=(
@@ -58,6 +75,24 @@ class Parameters(BaseModel):
             "no capture; ephemeral scratch unless persist=True."
         ),
     )
+
+    @property
+    def validated_writable_paths(self) -> list[Path]:
+        """Resolve writable paths that exist, are directories, and are absolute.
+
+        Only absolute real directories are bound; everything else is dropped
+        so traversal or a nonexistent path cannot weaken the sandbox or abort
+        the run. Symlinks are resolved to their real target.
+        """
+        out: list[Path] = []
+        for raw in self.writable_paths:
+            try:
+                candidate = Path(raw).expanduser().resolve()
+            except OSError:
+                continue
+            if candidate.is_dir():
+                out.append(candidate)
+        return out
 
 
 async def execute(ctx: ToolExecutionContext) -> ToolResult:
@@ -109,6 +144,26 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
 
     capture_root = _resolve_workspace_root(ctx)
     scratch_dir = _make_scratch_dir(ctx, session_key)
+    writable_extra: list[str] = []
+    for extra in params.validated_writable_paths:
+        writable_extra += ["--bind", str(extra), str(extra)]
+
+    # A caller-set cwd must exist inside the namespace: within the capture
+    # root, under scratch, or one of the extra writable binds. Otherwise the
+    # sandbox runs from a default path rather than failing opaquely.
+    cwd: Path | None = None
+    if params.cwd:
+        try:
+            resolved_cwd = Path(params.cwd).expanduser().resolve()
+        except OSError:
+            resolved_cwd = None  # type: ignore[assignment]
+        if resolved_cwd is not None and (
+            _is_within(resolved_cwd, capture_root)
+            or _is_within(resolved_cwd, scratch_dir)
+            or any(_is_within(resolved_cwd, extra) for extra in params.validated_writable_paths)
+        ):
+            cwd = resolved_cwd
+
     if use_overlay:
         overlay = OverlayBackend(layers_dir, layer_id, bind_target=capture_root)
         backend = overlay
@@ -127,12 +182,20 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         ]
         child_argv = params.argv
 
+    if cwd is not None:
+        child_argv = [
+            "/bin/sh", "-c",
+            f"cd {_sh_quote(str(cwd))} && exec \"$@\"",
+            "_", *child_argv,
+        ]
+
     try:
         argv = build_bwrap_argv(
             bwrap_path=caps.bwrap_path or "bwrap",
             network=params.network,
             child_argv=child_argv,
             backend_bind_args=bind_args,
+            writable_extra=writable_extra,
         )
         result = await run_process(
             argv,
@@ -158,6 +221,8 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         "truncated": result.output_truncated,
         "capture_root": str(capture_root),
         "scratch_dir": str(scratch_dir),
+        "cwd": str(cwd) if cwd is not None else "",
+        "writable_paths": [str(p) for p in params.validated_writable_paths],
     }
     if use_overlay:
         output_json["layer_id"] = layer_id
@@ -249,3 +314,17 @@ def _session_log_path(ctx: ToolExecutionContext) -> Path:
     """Per-session audit log the user can read (commands + output)."""
     base = Path(ctx.data_dir) if ctx.data_dir else Path.home() / ".lisa"
     return base / "logs" / f"bwrap-{_session_key(ctx)}.log"
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    """Return whether ``path`` resolves under ``parent`` (or equals it)."""
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _sh_quote(value: str) -> str:
+    """POSIX single-quote a fragment for the /bin/sh cwd wrapper."""
+    return "'" + value.replace("'", "'\\''") + "'"
