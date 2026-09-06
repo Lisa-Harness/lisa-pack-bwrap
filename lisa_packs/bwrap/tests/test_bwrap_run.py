@@ -132,3 +132,37 @@ async def test_overlay_requested_but_unavailable_reports_degraded(
     assert result.output_json["persistence"] == "ephemeral"
     assert result.output_json["degraded"] is True
     assert "missing" in result.output_json
+    # The note carries the precise cause, not the generic bwrap-install hint.
+    assert result.output_json["note"].startswith(
+        "overlayfs capture was requested but is unavailable on this host"
+    )
+
+
+@pytest.mark.asyncio
+async def test_overlay_cap_drop_note_omits_install_hint(monkeypatch, tmp_path: Path) -> None:
+    """The structural bwrap cap-drop cause must NOT suggest reinstalling bwrap."""
+    class _Caps:
+        available = True
+        can_overlay = False
+        bwrap_path = "/usr/bin/bwrap"
+        missing = (
+            "bwrap drops all capabilities from the child (CapEff=0), so the "
+            "overlay mount inside the namespace is denied (EPERM)."
+        )
+        overlay_reason = (
+            "bwrap drops all capabilities from the child (CapEff=0), so the "
+            "overlay mount inside the namespace is denied (EPERM). The kernel "
+            "itself allows unprivileged overlayfs - the same mount succeeds "
+            "via 'unshare --user --map-root-user'. overlayfs capture inside "
+            "bwrap is structurally unavailable with this bubblewrap build; "
+            "sandboxing still works with ephemeral tmpfs."
+        )
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    monkeypatch.setattr(bwrap_run, "run_process", _fake_run_process)
+    ctx = _ctx(data_dir=str(tmp_path), parameters={"argv": ["true"], "persist": True})
+    result = await bwrap_run.execute(ctx)
+    assert result.output_json["degraded"] is True
+    note = result.output_json["note"]
+    assert "bwrap drops all capabilities" in note
+    assert "zypper install bubblewrap" not in note

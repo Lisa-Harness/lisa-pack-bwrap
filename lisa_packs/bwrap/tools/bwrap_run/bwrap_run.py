@@ -150,11 +150,15 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
     if overlay_requested_but_unavailable:
         output_json["degraded"] = True
         output_json["missing"] = list(caps.missing)
+        # ``overlay_reason`` is new; tolerate capability objects without it.
+        reason = getattr(caps, "overlay_reason", "") or "; ".join(caps.missing)
+        if not reason.endswith("."):
+            reason += "."
         output_json["note"] = (
-            "overlayfs capture was requested but unprivileged overlayfs is "
-            "unavailable on this host; mutations went to ephemeral tmpfs and "
-            "were discarded on exit. See sandboxing_degraded.md. "
-            + _REMEDIATION_HINT
+            "overlayfs capture was requested but is unavailable on this host: "
+            f"{reason} Mutations went to ephemeral tmpfs and were discarded "
+            "on exit. See sandboxing_degraded.md."
+            + ("" if "bwrap drops all capabilities" in reason else f" {_REMEDIATION_HINT}")
         )
 
     return ToolResult(
