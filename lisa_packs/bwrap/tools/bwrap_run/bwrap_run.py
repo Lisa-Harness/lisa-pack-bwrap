@@ -261,25 +261,15 @@ def _resolve_workspace_root(ctx: ToolExecutionContext) -> Path:
     ``persist`` run staged changes to a metadata dir while the model believed
     it had merged workspace edits. The workspace path is NOT carried on
     ``ToolExecutionContext`` (only the ``workspace_id`` slug), so it is read
-    from session pack configuration — the same channel the coding pack uses —
-    falling back to the process CWD and finally ``data_dir``.
+    from session pack configuration — via the shared
+    ``sdk.workspace.resolve_workspace_root`` (lenient mode), the same single
+    rule the coding pack uses (strict there) and the host command uses. A
+    sandbox with no configured workspace is a degraded-but-runnable condition,
+    so the lenient policy falls back across CWD then ``data_dir`` then home.
     """
-    raw = ""
-    cfg = getattr(ctx, "pack_config", None)
-    if isinstance(cfg, dict):
-        raw = str(cfg.get("workspace_root", "") or "")
-    else:  # tolerate a typed config object exposing the same attribute
-        raw = str(getattr(cfg, "workspace_root", "") or "")
-    if raw:
-        candidate = Path(raw).expanduser()
-        root = (candidate if candidate.is_absolute() else Path.cwd() / candidate).resolve()
-        if root.is_dir():
-            return root
-    # No configured workspace: the process CWD is the host's working project.
-    cwd = Path.cwd()
-    if cwd.is_dir():
-        return cwd
-    return Path(ctx.data_dir) if ctx.data_dir else Path.home()
+    from sdk.workspace import resolve_workspace_root
+
+    return resolve_workspace_root(ctx, require_git=False)
 
 
 def _make_scratch_dir(ctx: ToolExecutionContext, session_key: str) -> Path:
