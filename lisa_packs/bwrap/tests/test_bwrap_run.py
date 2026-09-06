@@ -20,6 +20,7 @@ def _ctx(**overrides) -> ToolExecutionContext:
         session_plan_digest="digest",
         parameters={"argv": ["echo", "hi"]},
         data_dir="",
+        pack_config={},
     )
     base.update(overrides)
     return ToolExecutionContext(**base)
@@ -90,6 +91,74 @@ async def test_default_backend_is_tmpfs_not_overlay(monkeypatch, tmp_path: Path)
     # No layer is created when not requested.
     assert "layer_id" not in result.output_json
     assert "degraded" not in result.output_json
+    # The model gets a writable, host-visible scratch area in tmpfs mode.
+    assert result.output_json["scratch_dir"]
+    assert result.output_json["capture_root"]
+
+
+@pytest.mark.asyncio
+async def test_tmpfs_mode_binds_workspace_readonly_and_scratch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """tmpfs mode must add a RO workspace bind plus a writable scratch bind."""
+    class _Caps:
+        available = True
+        can_overlay = False
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    captured = {}
+
+    def _capture(argv, *, timeout_seconds, max_output_bytes, log_path=None):
+        captured["argv"] = list(argv)
+        return _fake_run_process(argv, timeout_seconds=timeout_seconds,
+                                 max_output_bytes=max_output_bytes, log_path=log_path)
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    monkeypatch.setattr(bwrap_run, "run_process", _capture)
+    ws = tmp_path / "project"
+    ws.mkdir()
+    ctx = _ctx(
+        data_dir=str(tmp_path / "data"),
+        pack_config={"workspace_root": str(ws)},
+        parameters={"argv": ["echo", "hi"]},
+    )
+    result = await bwrap_run.execute(ctx)
+    argv = captured["argv"]
+    scratch = result.output_json["scratch_dir"]
+    # Workspace bound read-only at its own path, and scratch bound read-write.
+    # Use exact flag/path triplets so we never match the "--ro-bind / /" root.
+    triplets = [argv[i : i + 3] for i in range(len(argv) - 2)]
+    assert ["--ro-bind", str(ws), str(ws)] in triplets
+    assert ["--bind", scratch, scratch] in triplets
+    assert result.output_json["capture_root"] == str(ws)
+
+
+@pytest.mark.asyncio
+async def test_overlay_capture_targets_workspace_not_data_dir(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The overlay lowerdir must be the configured workspace, not ~/.lisa."""
+    class _Caps:
+        available = True
+        can_overlay = True
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    monkeypatch.setattr(bwrap_run, "run_process", _fake_run_process)
+    ws = tmp_path / "project"
+    ws.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    ctx = _ctx(
+        data_dir=str(data),
+        pack_config={"workspace_root": str(ws)},
+        parameters={"argv": ["true"], "persist": True},
+    )
+    result = await bwrap_run.execute(ctx)
+    assert result.error == ""
+    assert result.output_json["capture_root"] == str(ws.resolve())
 
 
 @pytest.mark.asyncio

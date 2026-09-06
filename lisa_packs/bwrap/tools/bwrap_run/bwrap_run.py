@@ -12,6 +12,7 @@ overlayfs, layers, or mounts.
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from pathlib import Path
 
 from kernel.models import ToolExecutionContext, ToolResult
@@ -44,16 +45,17 @@ class Parameters(BaseModel):
     persist: bool = Field(
         default=False,
         description=(
-            "Opt in to capturing mutations in an overlayfs layer kept after "
-            "this run. Default off: writes go to ephemeral tmpfs and are "
-            "discarded. Requires unprivileged overlayfs on the host."
+            "Opt in to capturing mutations to the workspace in an overlayfs "
+            "layer kept after this run. Default off: writes go to an ephemeral "
+            "tmpfs scratch dir and are discarded. Requires unprivileged "
+            "overlayfs on the host."
         ),
     )
     layer_id: str = Field(
         default="",
         description=(
             "Explicit overlay layer id (opt in to overlayfs capture). Empty = "
-            "no capture; tmpfs unless persist=True."
+            "no capture; ephemeral scratch unless persist=True."
         ),
     )
 
@@ -105,14 +107,24 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
     overlay_requested_but_unavailable = wants_overlay and not caps.can_overlay
     use_overlay = wants_overlay and caps.can_overlay
 
+    capture_root = _resolve_workspace_root(ctx)
+    scratch_dir = _make_scratch_dir(ctx, session_key)
     if use_overlay:
-        overlay = OverlayBackend(layers_dir, layer_id, bind_target=_bind_target(ctx))
+        overlay = OverlayBackend(layers_dir, layer_id, bind_target=capture_root)
         backend = overlay
         bind_args: list[str] = overlay.bind_args()
         child_argv = overlay.overlay_mount_script(list(params.argv))
     else:
         backend = TmpfsBackend()
-        bind_args = []
+        # Give the model a WRITABLE, host-visible scratch area even in tmpfs
+        # mode: bind the real workspace read-only at its own path so the command
+        # can analyze it, plus an ephemeral (or per-session) scratch dir it can
+        # build a file copy in and test-apply a patch against. Everything under
+        # scratch is discarded unless the caller persisted it via a layer.
+        bind_args = [
+            "--ro-bind", str(capture_root), str(capture_root),
+            "--bind", str(scratch_dir), str(scratch_dir),
+        ]
         child_argv = params.argv
 
     try:
@@ -144,6 +156,8 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         "persistence": persistence,
         "timed_out": result.timed_out,
         "truncated": result.output_truncated,
+        "capture_root": str(capture_root),
+        "scratch_dir": str(scratch_dir),
     }
     if use_overlay:
         output_json["layer_id"] = layer_id
@@ -174,15 +188,50 @@ def _resolve_layers_dir(ctx: ToolExecutionContext) -> Path:
     return base / "layers"
 
 
-def _bind_target(ctx: ToolExecutionContext) -> Path:
-    """The scoped subtree overlaid when capture is requested.
+def _resolve_workspace_root(ctx: ToolExecutionContext) -> Path:
+    """Resolve the workspace root to capture/read from pack configuration.
 
-    Overlayfs lowerdir BCP: a stable, read-only subtree, never the whole live
-    root ``/``. We scope capture to the host-injected data dir (falling back to
-    the user's home) so writes the sandbox believes it makes land in the layer
-    and stay inspectable - not meaningless shadows of system paths.
+    This is the fix for the overlay-capture scope bug: the pack previously
+    captured ``ctx.data_dir`` (~/.lisa) instead of the user's workspace, so a
+    ``persist`` run staged changes to a metadata dir while the model believed
+    it had merged workspace edits. The workspace path is NOT carried on
+    ``ToolExecutionContext`` (only the ``workspace_id`` slug), so it is read
+    from session pack configuration — the same channel the coding pack uses —
+    falling back to the process CWD and finally ``data_dir``.
     """
+    raw = ""
+    cfg = getattr(ctx, "pack_config", None)
+    if isinstance(cfg, dict):
+        raw = str(cfg.get("workspace_root", "") or "")
+    else:  # tolerate a typed config object exposing the same attribute
+        raw = str(getattr(cfg, "workspace_root", "") or "")
+    if raw:
+        candidate = Path(raw).expanduser()
+        root = (candidate if candidate.is_absolute() else Path.cwd() / candidate).resolve()
+        if root.is_dir():
+            return root
+    # No configured workspace: the process CWD is the host's working project.
+    cwd = Path.cwd()
+    if cwd.is_dir():
+        return cwd
     return Path(ctx.data_dir) if ctx.data_dir else Path.home()
+
+
+def _make_scratch_dir(ctx: ToolExecutionContext, session_key: str) -> Path:
+    """A writable, host-visible scratch dir bound into the sandbox.
+
+    Host-visible so the user can inspect patch/script artifacts the model
+    staged; per-session so it survives across calls within a conversation when
+    a data_dir is available (else an ephemeral temp dir per call).
+    """
+    if ctx.data_dir:
+        scratch = Path(ctx.data_dir) / "scratch" / session_key
+        try:
+            scratch.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return Path(tempfile.mkdtemp(prefix="lisa-scratch-"))
+        return scratch
+    return Path(tempfile.mkdtemp(prefix="lisa-scratch-"))
 
 
 def _session_key(ctx: ToolExecutionContext) -> str:
