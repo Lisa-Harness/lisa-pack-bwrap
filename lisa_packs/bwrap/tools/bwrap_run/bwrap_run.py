@@ -18,8 +18,10 @@ from __future__ import annotations
 import hashlib
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from kernel.models import ToolExecutionContext, ToolResult
+from kernel.tools.output_stream import publish_tool_output
 from pydantic import BaseModel, Field
 
 from lisa_packs.bwrap.argv_builder import build_bwrap_argv_for_profile
@@ -258,6 +260,7 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
             timeout_seconds=params.timeout_seconds,
             max_output_bytes=_MAX_OUTPUT_BYTES,
             log_path=_session_log_path(ctx),
+            on_output=_tool_output_tap(ctx) if getattr(ctx, "stream_output", False) else None,
         )
     except Exception as exc:
         return ToolResult(tool_id=TOOL_ID, error=f"bwrap_run failed: {exc}")
@@ -364,6 +367,23 @@ def _session_log_path(ctx: ToolExecutionContext) -> Path:
     """Per-session audit log the user can read (commands + output)."""
     base = Path(ctx.data_dir) if ctx.data_dir else Path.home() / ".lisa"
     return base / "logs" / f"bwrap-{_session_key(ctx)}.log"
+
+
+def _tool_output_tap(ctx: ToolExecutionContext) -> Any:
+    """Build the incremental ``on_output(stream, line)`` callback.
+
+    Forwards each completed line to the operator surface via the turn's
+    ``lisa.tool_output`` bus topic. Only constructed when the caller (bash
+    composing through this tool, or the model calling bwrap_run directly when
+    its ``.tool.yml`` declares ``stream_output``) set ``ctx.stream_output``.
+    Publishing is best-effort: failures never break the sandboxed call.
+    """
+
+    def _on_output(stream: str, line: str) -> None:
+        if line:
+            publish_tool_output(ctx, text=line, stream=stream)
+
+    return _on_output
 
 
 def _is_within(path: Path, parent: Path) -> bool:

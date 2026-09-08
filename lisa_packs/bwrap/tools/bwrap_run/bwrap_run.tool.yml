@@ -4,4 +4,5 @@ module_path: lisa_packs.bwrap.tools.bwrap_run.bwrap_run
 description: "Run an argv inside a bubblewrap sandbox whose containment is set by the harness floor (session sandbox policy), not the model. Posture is floor-resolved: persistence ephemeral = writes discarded on exit; overlay = changes captured in a mergeable layer (persist/layer_id); readonly = no writable paths. The model passes tightening overrides (persistence/network/paths) that may only raise integrity above the floor, never loosen it; the floor's network/device/ipc and path visibility are emitted as bwrap argv. Approval-gated indirectly: bash_run (approval_required) is the user-facing approval boundary and composes through this tool as its sandbox backend."
 effect: execute
 approval_required: false
+stream_output: true
 exportable: true

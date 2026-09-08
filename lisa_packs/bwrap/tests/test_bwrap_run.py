@@ -65,7 +65,7 @@ class _Result:
     output_truncated = False
 
 
-def _fake_run_process(argv, *, timeout_seconds, max_output_bytes, log_path=None):
+def _fake_run_process(argv, *, timeout_seconds, max_output_bytes, log_path=None, on_output=None):
     async def _run():
         return _Result()
 
@@ -109,10 +109,11 @@ async def test_tmpfs_mode_binds_workspace_readonly_and_scratch(
 
     captured = {}
 
-    def _capture(argv, *, timeout_seconds, max_output_bytes, log_path=None):
+    def _capture(argv, *, timeout_seconds, max_output_bytes, log_path=None, on_output=None):
         captured["argv"] = list(argv)
         return _fake_run_process(argv, timeout_seconds=timeout_seconds,
-                                 max_output_bytes=max_output_bytes, log_path=log_path)
+                                 max_output_bytes=max_output_bytes, log_path=log_path,
+                                 on_output=on_output)
 
     monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
     monkeypatch.setattr(bwrap_run, "run_process", _capture)

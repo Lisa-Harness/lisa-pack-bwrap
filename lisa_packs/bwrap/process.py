@@ -7,7 +7,7 @@ real consumer exists - see docs/SHELL_PACKS_PLAN.md section 3.2).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 __all__ = ["ProcessResult", "run_process"]
@@ -28,16 +28,36 @@ async def _drain_limited(
     stream: asyncio.StreamReader,
     *,
     limit: int,
+    on_line: Callable[[str], None] | None = None,
+    buffer: list[str] | None = None,
 ) -> tuple[bytes, bool]:
-    """Drain a subprocess stream while retaining no more than ``limit`` bytes."""
+    """Drain a subprocess stream while retaining no more than ``limit`` bytes.
+
+    When ``on_line`` is provided, every complete line is forwarded to it as it
+    arrives (incremental operator-visible output); the trailing partial line
+    flushes on stream end. ``buffer`` is the mutable holder for the leftover
+    partial line between stdout/stderr tasks — a shared one is only needed
+    when both taps are active (unused otherwise).
+    """
     retained = bytearray()
     overflowed = False
+    pending = ""
     while chunk := await stream.read(8192):
         remaining = limit - len(retained)
         if remaining > 0:
             retained.extend(chunk[:remaining])
         if len(chunk) > remaining:
             overflowed = True
+        if on_line is not None:
+            pending += chunk.decode("utf-8", errors="replace")
+            while "\n" in pending:
+                line, _, pending = pending.partition("\n")
+                on_line(line)
+    if on_line is not None and pending:
+        on_line(pending)
+    if buffer is not None:
+        buffer.clear()
+        buffer.append(pending)
     return bytes(retained), overflowed
 
 
@@ -47,14 +67,30 @@ async def run_process(
     timeout_seconds: int,
     max_output_bytes: int,
     log_path: object | None = None,
+    on_output: Callable[[str, str], None] | None = None,
 ) -> ProcessResult:
     """Execute an explicit argument vector with bounded output and timeout.
 
     When ``log_path`` is provided, the full invocable argv and the retained
     stdout/stderr are appended to that log file for user-visible auditing.
+
+    When ``on_output`` is provided, it is called incrementally as
+    ``on_output(stream, line)`` for every complete line from either stream —
+    the caller's incremental-output tap (e.g. forwarding to the turn's
+    ``lisa.tool_output`` bus topic). Tap failures must be handled by the
+    callback itself; this function never inspects or suppresses them.
     """
     if not argv or not argv[0]:
         raise ValueError("A non-empty executable argument vector is required.")
+
+    def _stdout_tap(line: str) -> None:
+        if on_output is not None:
+            on_output("stdout", line)
+
+    def _stderr_tap(line: str) -> None:
+        if on_output is not None:
+            on_output("stderr", line)
+
     process = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
@@ -62,8 +98,12 @@ async def run_process(
     )
     assert process.stdout is not None
     assert process.stderr is not None
-    stdout_task = asyncio.create_task(_drain_limited(process.stdout, limit=max_output_bytes))
-    stderr_task = asyncio.create_task(_drain_limited(process.stderr, limit=max_output_bytes))
+    stdout_task = asyncio.create_task(
+        _drain_limited(process.stdout, limit=max_output_bytes, on_line=_stdout_tap)
+    )
+    stderr_task = asyncio.create_task(
+        _drain_limited(process.stderr, limit=max_output_bytes, on_line=_stderr_tap)
+    )
     timed_out = False
     try:
         await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
