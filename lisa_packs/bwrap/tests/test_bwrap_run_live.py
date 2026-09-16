@@ -6,6 +6,7 @@ Skipped automatically when bwrap is not available.
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -32,3 +33,7 @@ async def test_bwrap_run_echo_roundtrip(tmp_path: Path) -> None:
     assert result.output_json["sandboxed"] is True
     assert "hello-lisa" in result.output_text
     assert result.output_json["return_code"] == 0
+    # Real-namespace check: the identity stamp describes THIS host's mapping.
+    identity = result.output_json["identity"]
+    assert identity["sandbox_uid"] == 0
+    assert identity["host_uid"] == os.getuid()

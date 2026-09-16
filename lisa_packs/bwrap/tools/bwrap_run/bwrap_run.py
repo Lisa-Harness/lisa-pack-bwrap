@@ -16,6 +16,7 @@ layers, or mounts - only the persistence posture.
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,51 @@ _REMEDIATION_HINT = (
     "bubblewrap', Arch: 'pacman -S bubblewrap') and ensure unprivileged user "
     "namespaces are enabled. See sandboxing_degraded.md."
 )
+
+
+def _identity_block() -> dict[str, Any]:
+    """Describe the uid/gid mapping the unprivileged sandbox imposes.
+
+    Unprivileged bwrap can only install a single-entry user-namespace uid map
+    (the invoking host user -> sandbox uid 0). ``stat(2)`` inside the sandbox
+    can therefore only resolve owners inside the map: files owned by any other
+    host uid render as the overflow uid 65534 (``nobody:nobody``). This is a
+    display artifact, not a permissions change — we stamp it on every
+    sandboxed result so the model never misreads ``ls -l`` owner columns.
+    """
+    host_uid = os.getuid()
+    host_gid = os.getgid()
+    host_user = ""
+    try:  # pragma: no cover - pwd is POSIX-only; guarded for portability
+        import pwd
+
+        try:
+            host_user = pwd.getpwuid(host_uid).pw_name
+        except KeyError:
+            host_user = ""
+    except ImportError:
+        host_user = ""
+    map_text = (
+        f"{host_user or 'host user'}({host_uid}) -> sandbox root(0) "
+        "(single-entry uid map)"
+    )
+    return {
+        "sandbox_uid": 0,
+        "sandbox_gid": 0,
+        "host_uid": host_uid,
+        "host_gid": host_gid,
+        "host_user": host_user,
+        "map": map_text,
+        "note": (
+            "You run as mapped root via a single-entry uid map. Files owned by "
+            "any host uid other than yours display as nobody:nobody (uid "
+            "65534) - an overflow-uid display artifact of the user namespace. "
+            "Your own files display as root:root inside the sandbox. On-disk "
+            "ownership is unchanged; overlay-captured files are owned by the "
+            "real host user outside the sandbox. Do NOT chown/chmod to 'fix' "
+            "owners inside the sandbox. See sandbox_ownership.md."
+        ),
+    }
 
 
 class Parameters(BaseModel):
@@ -287,6 +333,7 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         "scratch_dir": str(scratch_dir),
         "cwd": str(cwd) if cwd is not None else "",
         "writable_paths": [str(p) for p in params.validated_writable_paths],
+        "identity": _identity_block(),
     }
     if use_overlay:
         output_json["layer_id"] = layer_id

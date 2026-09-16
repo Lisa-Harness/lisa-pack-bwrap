@@ -41,6 +41,8 @@ async def test_missing_bwrap_returns_sandboxed_false(monkeypatch, tmp_path: Path
     assert "bubblewrap" in result.error
     assert result.output_json["sandboxed"] is False
     assert result.output_json["missing"]
+    # Error paths carry no identity stamp: the sandbox never ran.
+    assert "identity" not in result.output_json
 
 
 @pytest.mark.asyncio
@@ -94,6 +96,14 @@ async def test_default_backend_is_tmpfs_not_overlay(monkeypatch, tmp_path: Path)
     # The model gets a writable, host-visible scratch area in tmpfs mode.
     assert result.output_json["scratch_dir"]
     assert result.output_json["capture_root"]
+    # Identity mapping is stamped on every sandboxed success.
+    identity = result.output_json["identity"]
+    assert identity["sandbox_uid"] == 0
+    assert identity["sandbox_gid"] == 0
+    assert identity["host_uid"] > 0
+    assert "nobody:nobody" in identity["note"]
+    assert "sandbox_ownership.md" in identity["note"]
+    assert "single-entry uid map" in identity["map"]
 
 
 @pytest.mark.asyncio
@@ -179,6 +189,12 @@ async def test_overlay_opt_in_when_available(monkeypatch, tmp_path: Path) -> Non
     assert result.output_json["backend"] == "overlay"
     assert result.output_json["persistence"] == "persistent"
     assert result.output_json["layer_id"]
+    # Overlay path carries the same identity contract as tmpfs.
+    identity = result.output_json["identity"]
+    assert identity["sandbox_uid"] == 0
+    assert identity["host_uid"] > 0
+    assert "nobody:nobody" in identity["note"]
+    assert "chown" in identity["note"]
 
 
 @pytest.mark.asyncio
