@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -151,7 +152,7 @@ class Parameters(BaseModel):
         sandbox or abort the run. Symlinks resolve to their target.
         """
         out: list[Path] = []
-        raw = self.overrides.get("paths") if isinstance(self.overrides, dict) else None
+        raw = self.overrides.get("paths") if isinstance(self.overrides, Mapping) else None
         if not isinstance(raw, dict):
             return out
         for raw_path, access in raw.items():
@@ -168,10 +169,10 @@ class Parameters(BaseModel):
 
 def _request_profile(params: Parameters) -> SandboxProfile:
     """Build the request-side profile from the model's tightening overrides."""
-    raw = params.overrides if isinstance(params.overrides, dict) else {}
+    raw = params.overrides if isinstance(params.overrides, Mapping) else {}
     paths: dict[str, str] = {}
     raw_paths = raw.get("paths")
-    if isinstance(raw_paths, dict):
+    if isinstance(raw_paths, Mapping):
         for raw_path, access in raw_paths.items():
             if isinstance(access, str) and access in ("rw", "ro", "hidden"):
                 paths[str(Path(str(raw_path)).expanduser())] = access

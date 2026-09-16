@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 import pytest
 
 from lisa_packs.bwrap.policy import (
@@ -20,6 +22,58 @@ def test_floor_from_config_defaults_when_absent() -> None:
     assert floor_from_config({}) == default_floor()
     assert floor_from_config({"unrelated": True}) == default_floor()
     assert floor_from_config(None) == default_floor()  # type: ignore[arg-type]
+
+
+def test_floor_from_config_parses_frozen_session_config() -> None:
+    """Frozen MappingProxyType config must parse, not fall back to defaults.
+
+    The kernel freezes session-authored pack configuration via
+    ``SessionPackConfigurationResolver._freeze``; a plain-dict guard there
+    silently discarded the harness's authored floor (2026-09-16 incident).
+    """
+    authored = {
+        "sandbox": {
+            "floor": {
+                "execution": "bare",
+                "persistence": "direct-write",
+                "network": "allow",
+                "device": "dev",
+                "ipc": "shared",
+                "paths": {"/home/adam/Code": "rw"},
+                "tmpfs_budget_bytes": 67108864,
+            }
+        }
+    }
+    frozen = MappingProxyType(
+        {key: MappingProxyType(value) for key, value in authored.items()}
+    )
+    floor = floor_from_config(frozen)
+    assert floor.execution == "bare"
+    assert floor.persistence == "direct-write"
+    assert floor.network == "allow"
+    assert floor.device == "dev"
+    assert floor.ipc == "shared"
+    assert floor.paths == {"/home/adam/Code": "rw"}
+    assert floor.tmpfs_budget_bytes == 67108864
+
+
+def test_floor_from_config_accepts_direct_alias() -> None:
+    """``persistence: direct`` is a common authoring alias for direct-write."""
+    floor = floor_from_config({"sandbox": {"floor": {"persistence": "direct"}}})
+    assert floor.persistence == "direct-write"
+
+
+def test_floor_from_config_frozen_rejects_bad_value() -> None:
+    """Frozen config still fails loudly on an invalid axis value."""
+    frozen = MappingProxyType(
+        {
+            "sandbox": MappingProxyType(
+                {"floor": MappingProxyType({"network": "sometimes"})}
+            )
+        }
+    )
+    with pytest.raises(PolicyError):
+        floor_from_config(frozen)
 
 
 def test_floor_from_config_reads_trusted_values() -> None:
@@ -73,7 +127,9 @@ def test_loosening_persistence_below_floor_rejected() -> None:
 
 
 def test_unspecified_request_rides_the_floor() -> None:
-    floor = SandboxProfile(network="deny", persistence="readonly", device=None, ipc=None)
+    floor = SandboxProfile(
+        network="deny", persistence="readonly", device=None, ipc=None
+    )
     # The request is empty: its values come from the pack safe default and are
     # then silently tightened to the floor on every floor-specified axis.
     eff = resolve_effective(floor, SandboxProfile())
@@ -98,9 +154,7 @@ def test_budget_ceiling_only_tightens() -> None:
 def test_per_path_floor_cannot_be_loosened() -> None:
     floor = SandboxProfile(paths={"/run/log/journal": "ro"})
     with pytest.raises(PolicyError):
-        resolve_effective(
-            floor, SandboxProfile(paths={"/run/log/journal": "rw"})
-        )
+        resolve_effective(floor, SandboxProfile(paths={"/run/log/journal": "rw"}))
     # and tightening a new path is fine
     eff = resolve_effective(floor, SandboxProfile(paths={"/etc": "hidden"}))
     assert eff.paths["/run/log/journal"] == "ro"
@@ -110,7 +164,9 @@ def test_per_path_floor_cannot_be_loosened() -> None:
 # --- load-time prerequisites ---------------------------------------------------
 
 
-def test_check_prerequisites_reports_missing_bwrap(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_check_prerequisites_reports_missing_bwrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr("lisa_packs.bwrap.probe.bwrap_binary", lambda: None)
     assert check_prerequisites() != []
 

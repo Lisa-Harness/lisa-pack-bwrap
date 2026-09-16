@@ -28,6 +28,7 @@ loudly rather than silently clamped.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from math import inf
 from pathlib import Path
@@ -312,16 +313,24 @@ def floor_from_config(config: object) -> SandboxProfile:
     missing/!mapping sandbox section yields the safe default floor. Unknown
     keys and invalid values raise PolicyError - the floor is user-authored, so
     a typo must be loud, not silently ignored.
+
+    The kernel freezes session-authored configuration into
+    ``MappingProxyType`` trees (``SessionPackConfigurationResolver._freeze``),
+    so every structural check here accepts any :class:`Mapping`, not just
+    ``dict``. A plain-dict guard would silently fall back to the shipped
+    default floor - dropping the harness's authored posture (e.g.
+    ``execution: bare``) without a word. "direct" is accepted as an alias for
+    the "direct-write" persistence value.
     """
-    if not isinstance(config, dict):
+    if not isinstance(config, Mapping):
         return default_floor()
     sandbox = config.get("sandbox")
-    if not isinstance(sandbox, dict):
+    if not isinstance(sandbox, Mapping):
         return default_floor()
     floor: object = sandbox.get("floor")
     if floor is None:
         return default_floor()
-    if not isinstance(floor, dict):
+    if not isinstance(floor, Mapping):
         raise PolicyError("sandbox.floor", type(floor).__name__, "a mapping")
 
     allowed = {
@@ -342,16 +351,19 @@ def floor_from_config(config: object) -> SandboxProfile:
 
     paths: dict[str, PathAccess] = {}
     raw_paths = floor.get("paths") or {}
-    if not isinstance(raw_paths, dict):
+    if not isinstance(raw_paths, Mapping):
         raise PolicyError("sandbox.floor.paths", type(raw_paths).__name__, "a mapping")
     for raw_path, access in raw_paths.items():
         if access not in _AXES["paths"]:
             raise PolicyError(f"sandbox.floor.paths[{raw_path}]", access, "rw/ro/hidden")
         paths[str(_normalize_path(str(raw_path)))] = access
 
+    persistence_raw = floor.get("persistence")
+    if isinstance(persistence_raw, str) and persistence_raw == "direct":
+        persistence_raw = "direct-write"
     return SandboxProfile(
         execution=_opt_axis("execution", floor.get("execution")),
-        persistence=_opt_axis("persistence", floor.get("persistence")),
+        persistence=_opt_axis("persistence", persistence_raw),
         network=_opt_axis("network", floor.get("network")),
         device=_opt_axis("device", floor.get("device")),
         ipc=_opt_axis("ipc", floor.get("ipc")),
