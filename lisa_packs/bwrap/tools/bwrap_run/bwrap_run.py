@@ -361,7 +361,9 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
 def _resolve_layers_dir(ctx: ToolExecutionContext) -> Path:
     """Resolve layer storage under the host-injected data dir."""
     base = Path(ctx.data_dir) if ctx.data_dir else Path.home() / ".lisa"
-    return base / "layers"
+    from sdk.layout import CACHE_DIR  # noqa: PLC0415
+
+    return base / CACHE_DIR / "layers"
 
 
 def _resolve_workspace_root(ctx: ToolExecutionContext) -> Path:
@@ -391,7 +393,9 @@ def _make_scratch_dir(ctx: ToolExecutionContext, session_key: str) -> Path:
     a data_dir is available (else an ephemeral temp dir per call).
     """
     if ctx.data_dir:
-        scratch = Path(ctx.data_dir) / "scratch" / session_key
+        from sdk.layout import RUN_DIR  # noqa: PLC0415
+
+        scratch = Path(ctx.data_dir) / RUN_DIR / session_key / "scratch"
         try:
             scratch.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -413,8 +417,10 @@ def _session_key(ctx: ToolExecutionContext) -> str:
 
 def _session_log_path(ctx: ToolExecutionContext) -> Path:
     """Per-session audit log the user can read (commands + output)."""
+    from sdk.layout import RUN_DIR  # noqa: PLC0415
+
     base = Path(ctx.data_dir) if ctx.data_dir else Path.home() / ".lisa"
-    return base / "logs" / f"bwrap-{_session_key(ctx)}.log"
+    return base / RUN_DIR / _session_key(ctx) / f"bwrap-{_session_key(ctx)}.log"
 
 
 def _tool_output_tap(ctx: ToolExecutionContext) -> Any:
