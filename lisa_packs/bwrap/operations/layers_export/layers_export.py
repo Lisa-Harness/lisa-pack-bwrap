@@ -260,7 +260,13 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             output_text=f"Export wrote diffs but failed to write metadata: {exc}",
         )
 
-    file_count = len([e for e in inventory if not e["whiteout"]])
+    file_count = len(
+        [
+            e
+            for e in inventory
+            if not e["whiteout"] and not e["path"].endswith("/")
+        ]
+    )
     whiteouts = len([e for e in inventory if e["whiteout"]])
     return OperationResult(
         status="success",

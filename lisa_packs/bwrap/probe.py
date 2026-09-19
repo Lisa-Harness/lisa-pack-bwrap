@@ -146,13 +146,12 @@ def _probe_overlay_userxattr(binary: str, probe_dir: Path) -> tuple[bool, str]:
 def _overlay_mount_works_outside_bwrap(probe_dir: Path) -> bool:
     """Check whether the SAME userxattr overlay mount succeeds via plain unshare.
 
-    The kernel may happily allow unprivileged overlay mounts while bwrap blocks
-    them (bwrap drops every capability from the child, and mount(2) needs
-    CAP_SYS_ADMIN in the owning user namespace). Running the identical mount
-    through ``unshare --user --map-root-user --mount`` isolates that: unshare
-    keeps full userns capabilities, so a success here proves the kernel is fine
-    and the blocker is bwrap itself — a structural limit, not a host-fixable
-    knob.
+    The launcher chain mounts the overlay in the ``unshare --user
+    --map-root-user --mount`` stage, which keeps full user-namespace
+    capabilities. Running the identical mount standalone isolates the kernel
+    question from the bwrap stage: a success here proves the kernel/LSM allow
+    unprivileged overlays, so a failing full chain points at the bwrap stage,
+    not at the host.
     """
     unshare = shutil.which("unshare")
     if unshare is None:
@@ -185,19 +184,20 @@ def _overlay_mount_works_outside_bwrap(probe_dir: Path) -> bool:
 def _classify_overlay_failure(binary: str, stderr: str) -> str:
     """Map an overlay-probe failure to the most precise host-specific cause.
 
-    Priority order: bwrap's capability drop (the mount was denied by EPERM
-    while the kernel demonstrably allows unprivileged overlays via unshare),
-    then an explicit kernel/LSM denial, then the generic unavailable message.
+    Priority order: the kernel demonstrably allows unprivileged overlays (the
+    standalone unshare mount works) while the full launcher chain failed - so
+    the blocker is the bwrap stage of the chain, reported as such; then an
+    explicit kernel/LSM denial; then the generic unavailable message.
     """
     probe_root = _ensure_classify_probe_dirs()
     if probe_root is not None and _overlay_mount_works_outside_bwrap(probe_root):
         return (
-            "bwrap drops all capabilities from the child (CapEff=0), so the "
-            "overlay mount inside the namespace is denied (EPERM). The kernel "
-            "itself allows unprivileged overlayfs - the same mount succeeds "
-            "via 'unshare --user --map-root-user'. overlayfs capture inside "
-            "bwrap is structurally unavailable with this bubblewrap build; "
-            "sandboxing still works with ephemeral tmpfs."
+            "the overlay mount works via 'unshare --user --map-root-user' but "
+            "the full launcher chain (mount + bwrap bind + --cap-drop ALL) "
+            "failed, so the bwrap stage is the blocker. The kernel allows "
+            "unprivileged overlayfs; check the bwrap stderr above (e.g. a "
+            "bubblewrap build that rejects one of the emitted flags). "
+            "Sandboxing still works with ephemeral tmpfs."
         )
     lowered = stderr.lower()
     if "overlay" in lowered and ("not supported" in lowered or "denied" in lowered):

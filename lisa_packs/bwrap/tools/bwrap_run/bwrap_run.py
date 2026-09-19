@@ -388,7 +388,14 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
             "overlayfs capture was requested but is unavailable on this host: "
             f"{reason} Mutations went to ephemeral tmpfs and were discarded "
             "on exit. See sandboxing_degraded.md."
-            + ("" if "bwrap drops all capabilities" in reason else f" {_REMEDIATION_HINT}")
+            + (
+                ""
+                if (
+                    "bwrap drops all capabilities" in reason
+                    or "the bwrap stage is the blocker" in reason
+                )
+                else f" {_REMEDIATION_HINT}"
+            )
         )
 
     return ToolResult(

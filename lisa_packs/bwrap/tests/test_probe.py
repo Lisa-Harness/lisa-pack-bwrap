@@ -21,7 +21,7 @@ from lisa_packs.bwrap.probe import (
 def test_classify_reports_cap_drop_when_unshare_mount_succeeds(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """Kernel allows the mount via unshare -> the blocker is bwrap, not the host."""
+    """Kernel allows the mount via unshare -> the blocker is the bwrap stage."""
 
     def _fake_unshare_ok(_probe_dir: Path) -> bool:
         return True
@@ -29,15 +29,17 @@ def test_classify_reports_cap_drop_when_unshare_mount_succeeds(
     monkeypatch.setattr(probe, "_overlay_mount_works_outside_bwrap", _fake_unshare_ok)
     monkeypatch.setattr(probe, "_ensure_classify_probe_dirs", lambda: tmp_path)
     reason = _classify_overlay_failure("/usr/bin/bwrap", "mount: must be superuser")
-    assert "bwrap drops all capabilities" in reason
+    assert "bwrap stage is the blocker" in reason
     assert "unshare --user --map-root-user" in reason
-    assert "structurally unavailable" in reason
+    # The old structural message is gone: the launcher pre-mounts, so
+    # bwrap's cap drop no longer blocks the mount itself.
+    assert "bwrap drops all capabilities" not in reason
 
 
 def test_classify_reports_kernel_denial_when_unshare_also_fails(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """Both bwrap and unshare fail with a denial -> kernel/LSM cause."""
+    """Both the chain and the standalone mount fail with a denial -> kernel cause."""
 
     def _fake_unshare_fail(_probe_dir: Path) -> bool:
         return False
