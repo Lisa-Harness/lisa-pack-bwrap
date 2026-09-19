@@ -378,6 +378,12 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
     }
     if use_overlay:
         output_json["layer_id"] = layer_id
+        output_json["note"] = (
+            "Writes are STAGED into capture layer "
+            f"'{layer_id}', not applied to the live filesystem. Relay the "
+            "layer_id to the user; review/apply happens via layers_export / "
+            "layers_apply (the USER applies). See layer_review.md."
+        )
     if overlay_requested_but_unavailable:
         output_json["degraded"] = True
         output_json["missing"] = list(caps.missing)

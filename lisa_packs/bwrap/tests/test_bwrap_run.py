@@ -189,6 +189,10 @@ async def test_overlay_opt_in_when_available(monkeypatch, tmp_path: Path) -> Non
     assert result.output_json["backend"] == "overlay"
     assert result.output_json["persistence"] == "persistent"
     assert result.output_json["layer_id"]
+    # Staged runs point the model at the review contract doc.
+    assert "STAGED" in result.output_json["note"]
+    assert "layer_review.md" in result.output_json["note"]
+    assert result.output_json["layer_id"] in result.output_json["note"]
     # Overlay path carries the same identity contract as tmpfs.
     identity = result.output_json["identity"]
     assert identity["sandbox_uid"] == 0
@@ -306,6 +310,8 @@ async def test_capture_paths_compose_extra_overlay_targets(
     assert f"overlay '{sys_dir}'" in script
     # Capture implies overlay posture even without persist/layer_id.
     assert result.output_json["persistence"] == "overlay"
+    # Staged runs point the model at the review contract doc.
+    assert "layer_review.md" in result.output_json["note"]
 
 
 @pytest.mark.asyncio
