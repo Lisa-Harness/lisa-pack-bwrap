@@ -58,6 +58,7 @@ def build_bwrap_argv_for_profile(
     profile: SandboxProfile,
     child_argv: Sequence[str],
     backend_bind_args: Sequence[str] = (),
+    drop_all_caps: bool = False,
 ) -> list[str]:
     """Build the bwrap argv from a resolved :class:`SandboxProfile`.
 
@@ -66,6 +67,16 @@ def build_bwrap_argv_for_profile(
     the fixed skeleton, so the harness floor (not the model) decides them at
     dispatch. Backend bind args arrive already formed; per-path floor binds are
     appended after the backend binds so a floor path binds on top.
+
+    ``paths`` entries with access ``capture`` are NOT emitted here: the
+    overlay backend owns those targets (it binds each merged view RW and its
+    launcher performs the mounts), so a capture path never becomes a plain
+    bind from this builder.
+
+    When ``drop_all_caps`` is true the argv gains ``--cap-drop ALL`` -
+    required when bwrap is exec'd inside the overlay launcher's user
+    namespace (which starts fully-capable) so the child ends up with the same
+    empty capability set as the ordinary unprivileged path.
     """
     if not child_argv:
         raise ValueError("child_argv must be a non-empty argument vector")
@@ -99,13 +110,16 @@ def build_bwrap_argv_for_profile(
     argv += list(backend_bind_args)
 
     # Floor/override per-path visibility, applied after backend binds.
+    # "capture" is skipped: the overlay backend owns those targets.
     for path, access in sorted(profile.paths.items()):
         if access == "rw":
             argv += ["--bind", path, path]
         elif access == "ro":
             argv += ["--ro-bind", path, path]
-        # "hidden" = no bind at all.
+        # "hidden" = no bind at all; "capture" = backend-owned overlay bind.
 
+    if drop_all_caps:
+        argv += ["--cap-drop", "ALL"]
     argv += ["--die-with-parent", "--new-session"]
     argv += ["--"]
     argv += list(child_argv)

@@ -16,6 +16,8 @@ runtime that `bash_run` composes through.
 | --- | --- | --- |
 | Tool | `bwrap_run` | Run an argv inside a bubblewrap sandbox whose containment is set by the harness floor, not the model. `approval_required: false` — approval lives on `bash_run`. |
 | Operation | `layers_list` | Read-only: list overlayfs layers (id, path, size) so the user/model can inspect sandbox-captured state. |
+| Operation | `layers_export` | Read-only: render a layer as reviewable unified diffs + inventory + manifest under `<data_dir>/runs/layers-exports/<id>/`. |
+| Operation | `layers_apply` | User-invoked write: apply a reviewed layer's captured writes to the live capture targets (honors whiteouts). |
 | Entry point | `lisa.extensions.prerequisites` | `policy.check_prerequisites` — host startup fails hard if bubblewrap is absent (no silent unsandboxed proceed). |
 | Entry point | `lisa.extensions.content_roots` | `lisa_packs.bwrap:get_content_root`. |
 
@@ -45,7 +47,7 @@ the floor leaves unspecified):
 | `ipc` | `shared` < `unshared` | `unshared` emits `--unshare-ipc`. |
 | `tmpfs_budget_bytes` | unbounded → finite | Size cap on the writable `/tmp` tmpfs (`--size N`). |
 | `timeout_ceiling_seconds` | unbounded → finite | Floor can only be lowered; only an explicitly larger requested cap violates. |
-| `paths` | per-path `rw` < `ro` < `hidden` | Per-path visibility (bind / ro-bind / omit). |
+| `paths` | per-path `rw` < `capture` < `ro` < `hidden` | Per-path visibility: real bind / overlay-captured bind / ro-bind / omit. `capture` stages writes for that path into the layer instead of the live filesystem (requires the overlay posture; a capture path joined with a looser persistence is a loud `PolicyError`). |
 
 ```python
 resolve_effective(floor, request, defaults=default_posture())
@@ -86,22 +88,37 @@ touch the real filesystem.
   `scratch_dir` for the user.
 - `readonly`: binds **no** writable paths at all.
 
-### overlay (opt-in — `persistence: overlay`, `persist`, or `layer_id`)
+### overlay (opt-in — `persistence: overlay`, `persist`, `layer_id`, or a `capture` path)
 
-`OverlayBackend`: writes are captured in an overlayfs `upper` under
-`<data_dir>/layers/<layer_id>/`, with the workspace as lowerdir at its real
-path (`capture_root`). Runs **only** when the effective persistence is overlay
-**and** unprivileged overlayfs (`userxattr`) is available; otherwise the
-request degrades to ephemeral *explicitly* (`degraded: true` + reason) — never
-silently.
+`OverlayBackend`: writes are captured in a per-target overlayfs `upper` under
+`<data_dir>/layers/<layer_id>/targets/<key>/`, one overlay **per capture
+target** — the workspace capture root plus any `capture`-posture path — each
+sharing the layer id. Runs only when the effective persistence is overlay
+**and** the launcher chain probe passes; otherwise the request degrades to
+ephemeral *explicitly* (`degraded: true` + reason) — never silently.
+
+The mounts are performed by a root-mapped launcher — `unshare --user
+--map-root-user --mount` — **before** bwrap runs, because bwrap always drops
+every capability from the child (`CapEff=0`), so a child-side `mount(2)` is
+structurally denied (EPERM). The verified chain: the launcher mounts one
+overlay per target onto the target's own path, then execs bwrap which binds
+each merged view read-write at its real path and ends `--cap-drop ALL`. The
+sandboxed child can read and write through the merged views but can never
+mount, unmount, or see the workdirs; captured files land owned by the real
+host user.
 
 - Mutations are captured either way; `persist` only controls whether the layer
   is retained past the session (`persistence: "persistent"` vs `"session"`).
 - `layer_id` is validated against path traversal (`sanitize_layer_id`);
   empty defaults to a per-session id (`session-<key>`). Result JSON reports
-  `backend`, `persistence`, `layer_id`, `capture_root`, `scratch_dir`.
-- `layers_list` enumerates layers (id, path, recursive size) for inspection.
-  v1 is deliberately read-mostly; export/teardown/diff are deferred to v2.
+  `backend`, `persistence`, `layer_id`, `capture_root`, `scratch_dir`, and
+  `captured_paths` (the extra capture targets beyond the workspace).
+- `layers_list` enumerates layers; `layers_export` renders a reviewable
+  diff/inventory; `layers_apply` (user-invoked) merges a reviewed layer onto
+  the live targets. The model relays the `layer_id`; the user reviews and
+  applies — see `content/prompts/layer_review.md`, and
+  `content/prompts/admin_posture.md` for the sysadmin three-tier posture
+  (contained diagnosis / captured mutation / privileged-verb bare).
 
 ## `bwrap_run` parameters
 
@@ -110,7 +127,7 @@ silently.
 | `argv` | list[string] | **required** | Command + args to run inside the sandbox. |
 | `timeout_seconds` | int | `60` | 1–3600; subject to the floor's `timeout_ceiling_seconds`. |
 | `cwd` | string | `""` | Working directory inside the sandbox; must resolve under the capture root, scratch dir, or a writable path override (anything else is ignored). |
-| `overrides` | object | `{}` | Tightening-only: `persistence` (`direct-write`\|`overlay`\|`ephemeral`\|`readonly`), `network` (`allow`\|`deny`), `paths` (`{path: rw|ro|hidden}`). Only `rw` paths that are real absolute directories are honored as extra writable binds. |
+| `overrides` | object | `{}` | Tightening-only: `persistence` (`direct-write`\|`overlay`\|`ephemeral`\|`readonly`), `network` (`allow`\|`deny`), `paths` (`{path: rw\|capture\|ro\|hidden}`). Only `rw` paths that are real absolute directories are honored as extra writable binds; `capture` paths that are real absolute directories are honored as extra overlay targets (implying the overlay posture). |
 | `persist` | bool | `false` | Retain the captured overlay layer after the session (overlay only). |
 | `layer_id` | string | `""` | Explicit overlay layer id; selects the overlay posture. |
 
@@ -119,10 +136,10 @@ request didn't already set it.
 
 Every result carries its real posture: `sandboxed: true`, `backend`,
 `persistence`, `return_code`, `stderr`, `timed_out`, `truncated`,
-`capture_root`, `scratch_dir`, `cwd`, `writable_paths`, plus `layer_id` when
-overlay ran and the `identity` block on every sandboxed success (error paths
-carry none — the sandbox never ran). Output is capped at 512 KiB; commands
-and output are appended to a per-session audit log at
+`capture_root`, `scratch_dir`, `cwd`, `writable_paths`, `captured_paths`, plus
+`layer_id` when overlay ran and the `identity` block on every sandboxed
+success (error paths carry none — the sandbox never ran). Output is capped at
+512 KiB; commands and output are appended to a per-session audit log at
 `<data_dir>/logs/bwrap-<key>.log`.
 
 ### File ownership inside the sandbox (the `identity` block)
@@ -158,9 +175,11 @@ effects.
 ## Capability probing & graceful degradation
 
 `probe.detect_capabilities()` is a *real* runtime probe, not a `which` check:
-it runs a trivial namespaced command, then differentially classifies whether
-unprivileged overlayfs mounts work inside bwrap (mirroring the real overlay
-argv shape). The probe tells apart:
+it runs a trivial namespaced command, then probes the exact **launcher chain**
+the overlay backend uses (`unshare --user --map-root-user --mount` mounts an
+overlay, then execs bwrap which binds the merged view and ends `--cap-drop
+ALL`). A probe whose argv differs from the real path can lie in both
+directions — so this one mirrors it faithfully. The probe tells apart:
 
 1. **binary absent** → sandbox unavailable, remediation points at the host
    package (`zypper/dnf/apt/pacman install bubblewrap`) and unprivileged
@@ -168,10 +187,8 @@ argv shape). The probe tells apart:
 2. **kernel/LSM denies the overlay mount** → namespaces still isolate;
    mutations fall back to ephemeral tmpfs (host-fixable: enable unprivileged
    overlay / adjust LSM policy);
-3. **bwrap drops all capabilities** (`CapEff=0`; `mount(2)` needs
-   `CAP_SYS_ADMIN` in the owning userns) → overlay capture is *structurally*
-   unavailable; ephemeral tmpfs still works. **Not host-fixable** — don't
-   retry `persist`/`layer_id`, don't tell the user to reinstall.
+3. **`unshare` absent** → the launcher chain cannot run; capture is
+   unavailable (install util-linux) but ephemeral tmpfs still works.
 
 When the pack is registered but the host can't run it, every error path
 carries a `missing` list, and results are stamped `sandboxed: false` /

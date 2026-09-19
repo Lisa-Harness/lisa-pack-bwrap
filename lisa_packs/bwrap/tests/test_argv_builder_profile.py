@@ -90,3 +90,34 @@ def test_floor_paths_bound_after_backend_binds():
     assert not any(t[1:] == ["/srv/hide", "/srv/hide"] for t in triplets if t)
     # Backend binds precede floor paths.
     assert argv.index("/scratch") < argv.index("/run/log/journal")
+
+
+def test_capture_paths_not_bound_by_builder():
+    """Capture entries are backend-owned: never a plain bind from the builder."""
+    profile = SandboxProfile(
+        execution="sandbox", persistence="overlay", network="deny",
+        device="minimal", ipc="unshared",
+        paths={"/etc": "capture", "/srv/safe": "rw"},
+    )
+    argv = _build(
+        profile=profile,
+        backend_bind_args=["--bind", "/etc", "/etc"],
+    )
+    triplets = [argv[i : i + 3] for i in range(len(argv) - 2)]
+    assert ["--bind", "/srv/safe", "/srv/safe"] in triplets
+    # Exactly one /etc bind pair - the backend's. The builder adds none.
+    etc_binds = [t for t in triplets if t[1:] == ["/etc", "/etc"]]
+    assert len(etc_binds) == 1
+
+
+def test_drop_all_caps_emits_cap_drop():
+    argv = _build(drop_all_caps=True)
+    i = argv.index("--cap-drop")
+    assert argv[i + 1] == "ALL"
+    # Cap-drop precedes the lifecycle flags and the child separator.
+    assert argv.index("--cap-drop") < argv.index("--die-with-parent")
+    assert argv.index("--cap-drop") < argv.index("--")
+
+
+def test_no_cap_drop_by_default():
+    assert "--cap-drop" not in _build()

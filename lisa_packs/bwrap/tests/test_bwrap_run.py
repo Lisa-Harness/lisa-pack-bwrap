@@ -218,6 +218,141 @@ async def test_overlay_requested_but_unavailable_reports_degraded(
     assert result.output_json["persistence"] == "ephemeral"
     assert result.output_json["degraded"] is True
     assert "missing" in result.output_json
+
+
+@pytest.mark.asyncio
+async def test_overlay_uses_launcher_chain_with_cap_drop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The overlay run wraps the bwrap argv in the unshare pre-mount chain."""
+    class _Caps:
+        available = True
+        can_overlay = True
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    captured = {}
+
+    def _capture(argv, *, timeout_seconds, max_output_bytes, log_path=None, on_output=None):
+        captured["argv"] = list(argv)
+        return _fake_run_process(argv, timeout_seconds=timeout_seconds,
+                                 max_output_bytes=max_output_bytes, log_path=log_path,
+                                 on_output=on_output)
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    monkeypatch.setattr(bwrap_run, "run_process", _capture)
+    ws = tmp_path / "project"
+    ws.mkdir()
+    ctx = _ctx(
+        data_dir=str(tmp_path / "data"),
+        pack_config={"workspace_root": str(ws)},
+        parameters={"argv": ["true"], "persist": True},
+    )
+    result = await bwrap_run.execute(ctx)
+    assert result.error == ""
+    argv = captured["argv"]
+    assert argv[0:5] == ["unshare", "--user", "--map-root-user", "--mount", "--"]
+    script = argv[-1]
+    # Mount onto the workspace's own path, then exec bwrap, ending cap-dropped.
+    assert f"lowerdir='{ws}'" in script
+    # Every argv token is shell-quoted before the exec.
+    assert "exec '/usr/bin/bwrap'" in script
+    assert "'--cap-drop' 'ALL'" in script
+    # bwrap binds the merged view RW (not the old child-mount script).
+    assert f"'--bind' '{ws}' '{ws}'" in script
+
+
+@pytest.mark.asyncio
+async def test_capture_paths_compose_extra_overlay_targets(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Requested capture paths become additional overlay targets, stamped."""
+    class _Caps:
+        available = True
+        can_overlay = True
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    captured = {}
+
+    def _capture(argv, *, timeout_seconds, max_output_bytes, log_path=None, on_output=None):
+        captured["argv"] = list(argv)
+        return _fake_run_process(argv, timeout_seconds=timeout_seconds,
+                                 max_output_bytes=max_output_bytes, log_path=log_path,
+                                 on_output=on_output)
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    monkeypatch.setattr(bwrap_run, "run_process", _capture)
+    ws = tmp_path / "project"
+    ws.mkdir()
+    sys_dir = tmp_path / "sysroot"
+    sys_dir.mkdir()
+    ctx = _ctx(
+        data_dir=str(tmp_path / "data"),
+        pack_config={"workspace_root": str(ws)},
+        parameters={
+            "argv": ["true"],
+            "overrides": {"paths": {str(sys_dir): "capture"}},
+        },
+    )
+    result = await bwrap_run.execute(ctx)
+    assert result.error == ""
+    assert result.output_json["backend"] == "overlay"
+    assert str(sys_dir) in result.output_json["captured_paths"]
+    script = captured["argv"][-1]
+    # Two mounts: the capture root and the captured path.
+    assert f"lowerdir='{ws}'" in script
+    assert f"lowerdir='{sys_dir}'" in script
+    assert f"overlay '{sys_dir}'" in script
+    # Capture implies overlay posture even without persist/layer_id.
+    assert result.output_json["persistence"] == "overlay"
+
+
+@pytest.mark.asyncio
+async def test_capture_paths_with_nonoverlay_persistence_rejected(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Capture + ephemeral is a loud policy error, never a silent degrade."""
+    class _Caps:
+        available = True
+        can_overlay = True
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    monkeypatch.setattr(bwrap_run, "run_process", _fake_run_process)
+    sys_dir = tmp_path / "sysroot"
+    sys_dir.mkdir()
+    ctx = _ctx(
+        data_dir=str(tmp_path),
+        parameters={
+            "argv": ["true"],
+            "overrides": {"persistence": "ephemeral", "paths": {str(sys_dir): "capture"}},
+        },
+    )
+    result = await bwrap_run.execute(ctx)
+    assert result.error
+    assert "capture" in result.error
+    assert "overlay" in result.error
+
+
+@pytest.mark.asyncio
+async def test_overlay_requested_but_unavailable_reports_precise_note(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Asking for overlay on a host without it degrades with a precise note."""
+    class _Caps:
+        available = True
+        can_overlay = False
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ("unprivileged overlayfs (userxattr) mounts unavailable",)
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    monkeypatch.setattr(bwrap_run, "run_process", _fake_run_process)
+    ctx = _ctx(data_dir=str(tmp_path), parameters={"argv": ["true"], "persist": True})
+    result = await bwrap_run.execute(ctx)
+    assert result.error == ""
+    assert result.output_json["degraded"] is True
     # The note carries the precise cause, not the generic bwrap-install hint.
     assert result.output_json["note"].startswith(
         "overlayfs capture was requested but is unavailable on this host"

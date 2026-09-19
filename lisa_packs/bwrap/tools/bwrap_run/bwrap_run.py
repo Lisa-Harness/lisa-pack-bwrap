@@ -123,8 +123,11 @@ class Parameters(BaseModel):
         description=(
             "Tightening overrides keyed by axis: persistence "
             "(direct-write|overlay|ephemeral|readonly), network (allow|deny), "
-            "paths (map of path -> rw|ro|hidden). Overrides can only raise "
-            "integrity above the harness floor, never loosen it."
+            "paths (map of path -> rw|capture|ro|hidden). `capture` stages "
+            "writes for that path into the overlay layer instead of the live "
+            "filesystem; it requires the overlay posture and is honored only "
+            "for real absolute directories. Overrides can only raise integrity "
+            "above the harness floor, never loosen it."
         ),
     )
     persist: bool = Field(
@@ -151,20 +154,35 @@ class Parameters(BaseModel):
         else is dropped so traversal or a nonexistent path cannot weaken the
         sandbox or abort the run. Symlinks resolve to their target.
         """
-        out: list[Path] = []
-        raw = self.overrides.get("paths") if isinstance(self.overrides, Mapping) else None
-        if not isinstance(raw, dict):
-            return out
-        for raw_path, access in raw.items():
-            if access != "rw":
-                continue
-            try:
-                candidate = Path(str(raw_path)).expanduser().resolve()
-            except OSError:
-                continue
-            if candidate.is_dir():
-                out.append(candidate)
-        return out
+        return _validated_paths(self.overrides, access="rw")
+
+    @property
+    def validated_captured_paths(self) -> list[Path]:
+        """Paths from ``overrides['paths']`` marked ``capture``, resolved.
+
+        Same contract as :attr:`validated_writable_paths` but for the
+        overlay-capture posture: only real absolute directories qualify.
+        """
+        return _validated_paths(self.overrides, access="capture")
+
+
+def _validated_paths(overrides: object, *, access: str) -> list[Path]:
+    """Shared resolver for rw/capture override paths (see Parameters)."""
+    raw = overrides if isinstance(overrides, Mapping) else {}
+    raw_paths = raw.get("paths") if isinstance(raw, Mapping) else None
+    if not isinstance(raw_paths, dict):
+        return []
+    out: list[Path] = []
+    for raw_path, path_access in raw_paths.items():
+        if path_access != access:
+            continue
+        try:
+            candidate = Path(str(raw_path)).expanduser().resolve()
+        except OSError:
+            continue
+        if candidate.is_dir():
+            out.append(candidate)
+    return out
 
 
 def _request_profile(params: Parameters) -> SandboxProfile:
@@ -174,7 +192,7 @@ def _request_profile(params: Parameters) -> SandboxProfile:
     raw_paths = raw.get("paths")
     if isinstance(raw_paths, Mapping):
         for raw_path, access in raw_paths.items():
-            if isinstance(access, str) and access in ("rw", "ro", "hidden"):
+            if isinstance(access, str) and access in ("rw", "capture", "ro", "hidden"):
                 paths[str(Path(str(raw_path)).expanduser())] = access
     return SandboxProfile(
         network=raw.get("network") if raw.get("network") in ("allow", "deny") else None,
@@ -197,8 +215,15 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
     try:
         floor = floor_from_config(ctx.pack_config)
         request = _request_profile(params)
-        # A requested layer_id / persist implies the overlay persistence posture.
-        if (params.layer_id or params.persist) and request.persistence is None:
+        # A requested layer_id / persist implies the overlay persistence
+        # posture; so do requested capture paths (capture is only defined
+        # under overlay - the policy join below enforces that loudly).
+        if (
+            (params.layer_id or params.persist)
+            and request.persistence is None
+        ) or (
+            request.persistence is None and "capture" in request.paths.values()
+        ):
             request = SandboxProfile(
                 network=request.network,
                 persistence="overlay",
@@ -251,9 +276,10 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
 
     capture_root = _resolve_workspace_root(ctx)
     scratch_dir = _make_scratch_dir(ctx, session_key)
+    captured_paths = _effective_captured_paths(eff, capture_root)
 
     # A caller-set cwd must exist inside the namespace: within the capture
-    # root, under scratch, or one of the extra writable binds.
+    # root, under scratch, one of the extra writable binds, or a captured path.
     cwd: Path | None = None
     if params.cwd:
         try:
@@ -264,14 +290,21 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
             _is_within(resolved_cwd, capture_root)
             or _is_within(resolved_cwd, scratch_dir)
             or any(_is_within(resolved_cwd, extra) for extra in params.validated_writable_paths)
+            or any(_is_within(resolved_cwd, captured) for captured in captured_paths)
         ):
             cwd = resolved_cwd
 
     if use_overlay:
-        overlay = OverlayBackend(layers_dir, layer_id, bind_target=capture_root)
+        # One overlay per capture target: the workspace capture root plus any
+        # capture-posture path. The launcher (unshare --user --map-root-user
+        # --mount) performs the mounts before exec'ing bwrap; bwrap only
+        # binds the merged views (see OverlayBackend for the verified chain).
+        overlay = OverlayBackend(
+            layers_dir, layer_id, [capture_root, *captured_paths]
+        )
         backend = overlay
         bind_args: list[str] = overlay.bind_args()
-        child_argv = overlay.overlay_mount_script(list(params.argv))
+        child_argv = list(params.argv)
     else:
         backend = TmpfsBackend()
         # Give the model a WRITABLE, host-visible scratch area in tmpfs mode
@@ -296,11 +329,17 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         ]
 
     try:
-        argv = build_bwrap_argv_for_profile(
+        bwrap_argv = build_bwrap_argv_for_profile(
             bwrap_path=caps.bwrap_path or "bwrap",
             profile=eff,
             child_argv=child_argv,
             backend_bind_args=bind_args,
+            drop_all_caps=use_overlay,
+        )
+        argv = (
+            overlay.launcher_argv(bwrap_argv)
+            if use_overlay
+            else bwrap_argv
         )
         result = await run_process(
             argv,
@@ -334,6 +373,7 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         "scratch_dir": str(scratch_dir),
         "cwd": str(cwd) if cwd is not None else "",
         "writable_paths": [str(p) for p in params.validated_writable_paths],
+        "captured_paths": [str(p) for p in captured_paths],
         "identity": _identity_block(),
     }
     if use_overlay:
@@ -447,6 +487,36 @@ def _is_within(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _effective_captured_paths(eff: SandboxProfile, capture_root: Path) -> list[Path]:
+    """Resolve the extra overlay-capture targets for an overlay-posture run.
+
+    The capture root (workspace) is always the first overlay target; this
+    adds every path the effective profile marks ``capture`` (floor-pinned or
+    model-requested) that is a real absolute directory. Non-directories and
+    paths already covered by the capture root are dropped so the mount set is
+    exactly the scoped, stable subtrees overlayfs requires.
+    """
+    out: list[Path] = []
+    for raw_path in sorted(eff.paths):
+        if eff.paths[raw_path] != "capture":
+            continue
+        try:
+            candidate = Path(raw_path).expanduser().resolve()
+        except OSError:
+            continue
+        if not candidate.is_dir():
+            continue
+        if _is_within(candidate, capture_root):
+            continue  # the capture root's own overlay already covers it
+        if any(
+            _is_within(candidate, existing) or _is_within(existing, candidate)
+            for existing in out
+        ):
+            continue  # overlapping targets: keep the first (wider) one
+        out.append(candidate)
+    return out
 
 
 def _sh_quote(value: str) -> str:

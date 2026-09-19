@@ -19,7 +19,15 @@ Lattice axes (loosest -> tightest), each ordered independently:
     ipc         shared < unshared         (--unshare-ipc)
     tmpfs_budget_bytes  inf -> finite     (--tmpfs size cap)
     timeout_ceiling_seconds  inf -> finite (floor can only be lowered)
-    paths       per-path rw < ro < hidden (--bind / --ro-bind / omit)
+    paths       per-path rw < capture < ro < hidden
+                (--bind / overlay-captured / --ro-bind / omit)
+
+``capture`` marks a path for overlay-backed mutation capture: the sandbox sees
+it writable, but every write lands in the layer's upper dir instead of the
+live filesystem. It sits between ``rw`` (real writes) and ``ro`` (no writes) on
+the integrity ladder. Capture requires the overlay persistence posture; an
+effective profile that combines capture paths with a looser persistence is a
+hard :class:`PolicyError`, never a silent degradation.
 
 ``resolve_effective`` joins the floor with a request; an *explicit* request to
 loosen below the floor is a hard :class:`PolicyError`, so the boundary is taught
@@ -70,7 +78,7 @@ _AXES: dict[str, tuple[str, ...]] = {
     "network": ("allow", "deny"),
     "device": ("dev", "minimal", "none"),
     "ipc": ("shared", "unshared"),
-    "paths": ("rw", "ro", "hidden"),
+    "paths": ("rw", "capture", "ro", "hidden"),
 }
 
 Execution = str
@@ -232,7 +240,7 @@ def resolve_effective(
 
     # Tighten the candidate up to the floor on each axis (floor is a minimum
     # integrity; unspecified or looser-by-default request fields ride the floor).
-    return SandboxProfile(
+    eff = SandboxProfile(
         execution=_tighten_opt("execution", candidate.execution, floor.execution),
         persistence=_tighten_opt(
             "persistence", candidate.persistence, floor.persistence
@@ -248,6 +256,31 @@ def resolve_effective(
             candidate.timeout_ceiling_seconds, floor.timeout_ceiling_seconds
         ),
     )
+    _check_capture_consistency(eff)
+    return eff
+
+
+def _check_capture_consistency(profile: SandboxProfile) -> None:
+    """Reject capture paths joined with a persistence posture that can't capture.
+
+    Overlay-backed capture only exists under the overlay persistence posture:
+    capture paths plus a looser effective persistence (direct-write, ephemeral,
+    readonly) would silently turn promised-captured writes into real writes
+    (direct-write) or discarded/misreported ones (ephemeral/readonly). That
+    is never silently degraded - it is a loud authoring error naming the
+    collision, so the user fixes the floor or the request explicitly.
+    """
+    captured = [
+        path for path, access in profile.paths.items() if access == "capture"
+    ]
+    if captured and profile.persistence != "overlay":
+        raise PolicyError(
+            "paths[capture]",
+            f"capture on {sorted(captured)} with persistence "
+            f"{profile.persistence!r}",
+            "persistence 'overlay' (capture paths require the overlay posture; "
+            "request persistence 'overlay', or use rw/ro/hidden for those paths)",
+        )
 
 
 def _tighten_paths(
@@ -353,10 +386,12 @@ def floor_from_config(config: object) -> SandboxProfile:
     raw_paths = floor.get("paths") or {}
     if not isinstance(raw_paths, Mapping):
         raise PolicyError("sandbox.floor.paths", type(raw_paths).__name__, "a mapping")
-    for raw_path, access in raw_paths.items():
-        if access not in _AXES["paths"]:
-            raise PolicyError(f"sandbox.floor.paths[{raw_path}]", access, "rw/ro/hidden")
-        paths[str(_normalize_path(str(raw_path)))] = access
+    for raw_path, raw_access in raw_paths.items():
+        if raw_access not in _AXES["paths"]:
+            raise PolicyError(
+                f"sandbox.floor.paths[{raw_path}]", str(raw_access), "rw/capture/ro/hidden"
+            )
+        paths[str(_normalize_path(str(raw_path)))] = raw_access
 
     persistence_raw = floor.get("persistence")
     if isinstance(persistence_raw, str) and persistence_raw == "direct":

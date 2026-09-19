@@ -1,0 +1,5 @@
+operation_id: layers_export
+pack_id: lisa-pack-bwrap
+module_path: lisa_packs.bwrap.operations.layers_export.layers_export
+description: "Render one overlayfs capture layer as a reviewable export: per-target unified diffs (against the live target), a file inventory with ownership/mode metadata, and a machine-readable manifest. Read-only: writes only into the requested export directory under the host data dir. The user reviews the export before layers_apply; the model relays the layer_id and never merges on its own."
+effect: read

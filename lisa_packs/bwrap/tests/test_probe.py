@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from lisa_packs.bwrap import probe
 from lisa_packs.bwrap.probe import (
     _classify_overlay_failure,
@@ -62,11 +64,45 @@ def test_classify_generic_fallback(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_probe_returns_reason_tuple_on_failure(monkeypatch, tmp_path: Path) -> None:
-    """The real probe reports (False, reason) and never raises on mount denial."""
+    """When the launcher chain fails, the probe reports (False, reason), never raises.
+
+    Failure is simulated at the mount step (the sh script exits nonzero) so
+    the test is host-independent: no real overlay capability is required
+    either way, and the contract under test is the (False, reason) tuple.
+    """
     monkeypatch.setattr(probe, "_classify_overlay_failure", lambda _b, _e: "cause-x")
+
+    class _FailedMount:
+        returncode = 1
+        stdout = b""
+        stderr = b"mount: must be superuser to use mount"
+
+    def _fake_run(argv, **kwargs):
+        return _FailedMount()
+
+    monkeypatch.setattr(probe.subprocess, "run", _fake_run)
     supported, reason = _probe_overlay_userxattr("/usr/bin/bwrap", tmp_path)
     assert supported is False
     assert reason == "cause-x"
+
+
+def test_probe_succeeds_on_supporting_host(tmp_path: Path) -> None:
+    """On a host with unprivileged userns + kernel overlay, the real chain works.
+
+    Skipped automatically when the launcher chain is unavailable (e.g. no
+    unshare, no userns, or overlay denied); on supporting hosts this is the
+    end-to-end guarantee that capture ACTUALLY works, not just classifies.
+    """
+    import shutil as _shutil
+
+    if _shutil.which("bwrap") is None or _shutil.which("unshare") is None:
+        pytest.skip("bwrap/unshare not installed")
+    supported, reason = _probe_overlay_userxattr("/usr/bin/bwrap", tmp_path)
+    if not supported and (
+        "not found on PATH" in reason or "could not run" in reason
+    ):
+        pytest.skip(f"launcher chain unavailable here: {reason}")
+    assert supported is True, reason
 
 
 def test_capabilities_carries_overlay_reason() -> None:

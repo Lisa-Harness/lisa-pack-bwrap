@@ -1,0 +1,5 @@
+operation_id: layers_apply
+pack_id: lisa-pack-bwrap
+module_path: lisa_packs.bwrap.operations.layers_apply.layers_apply
+description: "Apply one reviewed overlayfs capture layer to its live capture targets: copy each captured upper dir's contents over the live path, honoring whiteouts as deletions and recorded modes. This is the merge step the user runs AFTER reviewing the layers_export output; it mutates the live filesystem and is deliberately not invoked by the model on its own."
+effect: write

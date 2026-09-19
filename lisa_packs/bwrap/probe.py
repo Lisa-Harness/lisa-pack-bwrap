@@ -75,51 +75,71 @@ def _probe_bwrap_run(binary: str) -> bool:
 
 
 def _probe_overlay_userxattr(binary: str, probe_dir: Path) -> tuple[bool, str]:
-    """Confirm unprivileged overlayfs (userxattr) mounts work inside bwrap.
+    """Confirm overlayfs capture works via the launcher chain this pack uses.
 
-    This probe MUST mirror the real overlay argv shape (scoped RO lowerdir,
-    bound upper, bound pre-created merged mountpoint, NO workdir bound in, and
-    the same namespace flags as ``build_bwrap_argv``). A probe whose argv differs
-    from the real path can report success while the real run fails, or vice
-    versa.
+    This probe MUST mirror the real capture argv shape: ``unshare --user
+    --map-root-user --mount`` mounts one overlay per target onto the target's
+    own path (lowerdir = the live target, upper/work under the layers dir),
+    then execs bwrap which binds the merged views RW and ends
+    ``--cap-drop ALL``. A probe whose argv differs from the real path can
+    report success while the real run fails, or vice versa.
+
+    The legacy child-side mount (bwrap creates the namespace, the child runs
+    ``mount``) is NOT probed: bwrap always drops all capabilities from the
+    child, so that path is structurally EPERM on unprivileged hosts. The
+    launcher chain is the only overlay path the pack ships.
 
     Returns ``(supported, reason)``. ``reason`` is empty on success and carries
     a precise, host-specific diagnosis on failure so the degraded report points
     at the actual blocker instead of a generic kernel suggestion.
     """
+    if shutil.which("unshare") is None:
+        return False, (
+            "util-linux 'unshare' not found on PATH - the overlay launcher "
+            "chain requires it to create the root-mapped user namespace that "
+            "performs the overlay mounts"
+        )
+    lower = probe_dir / "lower"
     upper = probe_dir / "upper"
     work = probe_dir / "work"
     merged = probe_dir / "merged"
-    lower = probe_dir / "lower"
     for path in (upper, work, merged, lower):
         path.mkdir(parents=True, exist_ok=True)
-    script = (
+    marker = merged / "probe.txt"  # written via the merged view by the child
+    inner_argv = [
+        binary,
+        "--unshare-pid", "--unshare-uts", "--unshare-ipc", "--unshare-net",
+        "--ro-bind", "/", "/",
+        "--proc", "/proc", "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--bind", str(merged), str(merged),
+        "--die-with-parent", "--new-session", "--cap-drop", "ALL",
+        "--", "sh", "-c", f"echo probe > {marker}",
+    ]
+    quoted = " ".join("'" + a.replace("'", "'\\''") + "'" for a in inner_argv)
+    mount = (
         "mount -t overlay -o userxattr,"
-        f"lowerdir={lower},upperdir={upper},workdir={work} overlay {merged}"
+        f"lowerdir={lower},upperdir={upper},workdir={work} "
+        f"overlay {merged} && exec {quoted}"
     )
     try:
         proc = subprocess.run(
             [
-                binary,
-                "--unshare-pid", "--unshare-uts", "--unshare-ipc",
-                "--ro-bind", "/", "/",
-                "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-                "--ro-bind", str(lower), str(lower),
-                "--bind", str(upper), str(upper),
-                "--bind", str(merged), str(merged),
-                "--die-with-parent", "--new-session",
-                "--",
-                "/bin/sh", "-c", script,
+                "unshare", "--user", "--map-root-user", "--mount", "--",
+                "/bin/sh", "-c", mount,
             ],
             capture_output=True,
             timeout=15,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False, "overlay probe could not run (bwrap invocation failed)"
-    if proc.returncode == 0:
+        return False, "overlay probe could not run (unshare invocation failed)"
+    if proc.returncode == 0 and (upper / "probe.txt").is_file():
+        # The child's write through the merged view lands in the overlay's
+        # upper dir; the host never sees the merged view (it exists only in
+        # the launcher's mount namespace), so success is asserted on upper.
         return True, ""
-    stderr = (proc.stderr or "").decode("utf-8", errors="replace")
+    stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
     return False, _classify_overlay_failure(binary, stderr)
 
 

@@ -161,6 +161,80 @@ def test_per_path_floor_cannot_be_loosened() -> None:
     assert eff.paths["/etc"] == "hidden"
 
 
+# --- capture paths ------------------------------------------------------------
+
+
+def test_capture_ordering_between_rw_and_ro() -> None:
+    """capture sits between rw (real writes) and ro (no writes) on the ladder."""
+    # rw request against a capture floor is a loosening -> rejected.
+    floor = SandboxProfile(persistence="overlay", paths={"/etc": "capture"})
+    with pytest.raises(PolicyError):
+        resolve_effective(floor, SandboxProfile(paths={"/etc": "rw"}))
+    # capture tightened up to ro is allowed (and stays captured: no writes).
+    eff = resolve_effective(floor, SandboxProfile(paths={"/etc": "ro"}))
+    assert eff.paths["/etc"] == "ro"
+    # capture tightened up to hidden is allowed.
+    eff = resolve_effective(floor, SandboxProfile(paths={"/etc": "hidden"}))
+    assert eff.paths["/etc"] == "hidden"
+
+
+def test_capture_tightens_rw_request() -> None:
+    """An rw floor path joined with a capture request tightens to capture."""
+    floor = SandboxProfile(persistence="overlay", paths={"/etc": "rw"})
+    eff = resolve_effective(
+        floor, SandboxProfile(persistence="overlay", paths={"/etc": "capture"})
+    )
+    assert eff.paths["/etc"] == "capture"
+
+
+def test_floor_from_config_parses_capture_paths() -> None:
+    cfg = {
+        "sandbox": {
+            "floor": {
+                "execution": "sandbox",
+                "persistence": "overlay",
+                "paths": {"/etc": "capture", "/var/log": "ro"},
+            }
+        }
+    }
+    floor = floor_from_config(cfg)
+    assert floor.paths == {"/etc": "capture", "/var/log": "ro"}
+
+
+def test_capture_requires_overlay_persistence() -> None:
+    """capture paths joined with a non-overlay persistence is a loud error."""
+    # ephemeral default posture + capture floor path -> the effective join
+    # can never honor capture; refuse rather than silently degrading.
+    floor = SandboxProfile(persistence="overlay", paths={"/etc": "capture"})
+    request = SandboxProfile(persistence="ephemeral")  # explicit tighten away
+    with pytest.raises(PolicyError) as exc:
+        resolve_effective(floor, request)
+    assert "capture" in str(exc.value)
+    assert "overlay" in str(exc.value)
+
+
+def test_capture_with_overlay_persistence_is_consistent() -> None:
+    floor = SandboxProfile(persistence="overlay", paths={"/etc": "capture"})
+    eff = resolve_effective(
+        floor, SandboxProfile(persistence="overlay", paths={"/srv": "rw"})
+    )
+    assert eff.paths == {"/etc": "capture", "/srv": "rw"}
+    assert eff.persistence == "overlay"
+
+
+def test_capture_floor_with_ephemeral_default_is_loud() -> None:
+    """A capture floor path with the pack's ephemeral default is an authoring error.
+
+    default_posture() starts ephemeral; if the floor pins capture on a path
+    but leaves persistence unset, the tightened persistence stays ephemeral
+    and capture could not work - the join must refuse loudly instead.
+    """
+    floor = SandboxProfile(paths={"/etc": "capture"})  # no persistence pinned
+    with pytest.raises(PolicyError) as exc:
+        resolve_effective(floor, SandboxProfile())
+    assert "capture" in str(exc.value)
+
+
 # --- load-time prerequisites ---------------------------------------------------
 
 
