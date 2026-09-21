@@ -1,7 +1,8 @@
 """Bounded subprocess execution for the bwrap pack.
 
-Self-contained (the SDK ``run_process`` promotion is deferred until a second
-real consumer exists - see docs/SHELL_PACKS_PLAN.md section 3.2).
+Self-contained: the SDK ``run_process`` promotion is deferred until a second
+real consumer exists (promote shared helpers to the SDK when duplication is
+real, not before).
 """
 
 from __future__ import annotations
