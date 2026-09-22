@@ -385,6 +385,20 @@ def floor_from_config(config: object) -> SandboxProfile:
     paths: dict[str, PathAccess] = {}
     raw_paths = floor.get("paths") or {}
     if not isinstance(raw_paths, Mapping):
+        # A bare indented path under `paths:` in YAML parses as a plain
+        # scalar string, not a mapping (easy authoring mistake:
+        #   paths:
+        #     /some/dir            <- WRONG: this node is a single string
+        #     /some/dir: rw        <- RIGHT: path -> access mapping
+        # ). Name the exact fix instead of the cryptic "cannot be loosened
+        # to 'str'" lattice message.
+        if isinstance(raw_paths, str):
+            raise PolicyError(
+                "sandbox.floor.paths",
+                f"a bare path string ({raw_paths!r})",
+                "a mapping of path -> rw/capture/ro/hidden (each path needs an "
+                "access level after it, e.g. '/some/dir: rw')",
+            )
         raise PolicyError("sandbox.floor.paths", type(raw_paths).__name__, "a mapping")
     for raw_path, raw_access in raw_paths.items():
         if raw_access not in _AXES["paths"]:
