@@ -161,6 +161,39 @@ def test_per_path_floor_cannot_be_loosened() -> None:
     assert eff.paths["/etc"] == "hidden"
 
 
+def test_direct_write_requires_explicit_ancestor_floor_permission() -> None:
+    floor = SandboxProfile(persistence="direct-write", paths={"/workspace": "rw"})
+    effective = resolve_effective(
+        floor,
+        SandboxProfile(persistence="direct-write", paths={"/workspace/worktree": "rw"}),
+    )
+    assert effective.paths["/workspace/worktree"] == "rw"
+
+    for restricted in (
+        SandboxProfile(persistence="direct-write"),
+        SandboxProfile(persistence="direct-write", paths={"/workspace": "ro"}),
+    ):
+        with pytest.raises(PolicyError, match="paths"):
+            resolve_effective(
+                restricted,
+                SandboxProfile(
+                    persistence="direct-write",
+                    paths={"/workspace/worktree": "rw"},
+                ),
+            )
+
+
+def test_nested_path_uses_nearest_floor_permission() -> None:
+    floor = SandboxProfile(
+        persistence="direct-write",
+        paths={"/workspace": "ro", "/workspace/worktree": "rw"},
+    )
+    effective = resolve_effective(
+        floor, SandboxProfile(paths={"/workspace/worktree/src": "rw"}),
+    )
+    assert effective.paths["/workspace/worktree/src"] == "rw"
+
+
 # --- capture paths ------------------------------------------------------------
 
 
@@ -214,7 +247,7 @@ def test_capture_requires_overlay_persistence() -> None:
 
 
 def test_capture_with_overlay_persistence_is_consistent() -> None:
-    floor = SandboxProfile(persistence="overlay", paths={"/etc": "capture"})
+    floor = SandboxProfile(persistence="overlay", paths={"/etc": "capture", "/srv": "rw"})
     eff = resolve_effective(
         floor, SandboxProfile(persistence="overlay", paths={"/srv": "rw"})
     )

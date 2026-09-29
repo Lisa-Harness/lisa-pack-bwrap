@@ -206,13 +206,28 @@ def _dominates(candidate: SandboxProfile, floor: SandboxProfile) -> None:
         if float(c) > float(f):
             raise PolicyError(axis, str(c), str(f))
 
-    # Per-path: a path the floor pins may not be loosened.
-    for path, floor_access in floor.paths.items():
-        cand_access = candidate.paths.get(path)
-        if cand_access is not None and _level("paths", cand_access) < _level(
-            "paths", floor_access
-        ):
-            raise PolicyError(f"paths[{path}]", cand_access, floor_access)
+    # A nested bind inherits the nearest floor path. In particular, real
+    # writes require an explicit trusted rw grant for that subtree.
+    for path, cand_access in candidate.paths.items():
+        requested = Path(path).expanduser().resolve()
+        matches = (
+            (Path(floor_path).expanduser().resolve(), access)
+            for floor_path, access in floor.paths.items()
+        )
+        nearest = max(
+            (
+                (floor_path, access)
+                for floor_path, access in matches
+                if requested.is_relative_to(floor_path)
+            ),
+            key=lambda match: len(match[0].parts),
+            default=None,
+        )
+        if nearest is None:
+            if cand_access == "rw":
+                raise PolicyError(f"paths[{path}]", cand_access, "an explicit rw floor path")
+        elif _level("paths", cand_access) < _level("paths", nearest[1]):
+            raise PolicyError(f"paths[{path}]", cand_access, nearest[1])
 
 
 def resolve_effective(
