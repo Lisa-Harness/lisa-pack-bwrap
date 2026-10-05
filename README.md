@@ -197,7 +197,7 @@ in the error.
 | Parameter | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `argv` | list[string] | **required** | Command + args to run inside the sandbox. |
-| `timeout_seconds` | int | `60` | 1–3600; subject to the floor's `timeout_ceiling_seconds`. |
+| `timeout_seconds` | int | `60` | 1–3600; subject to the floor's `timeout_ceiling_seconds`. This kills a silent child. The kernel wrapper is disabled for this tool (`timeout_seconds: 0` in `bwrap_run.tool.yml`) — bwrap_run self-bounds. |
 | `cwd` | string | `""` | Working directory inside the sandbox; must resolve under the capture root, scratch dir, or a writable path override (anything else is ignored). |
 | `overrides` | object | `{}` | Tightening-only: `persistence` (`direct-write`\|`overlay`\|`ephemeral`\|`readonly`), `network` (`allow`\|`deny`), `paths` (`{path: rw\|capture\|ro\|hidden}`). Only `rw` paths that are real absolute directories are honored as extra writable binds; `capture` paths that are real absolute directories are honored as extra overlay targets (implying the overlay posture). |
 | `persist` | bool | `false` | Retain the captured overlay layer after the session (overlay only). |
@@ -205,6 +205,22 @@ in the error.
 
 A requested `layer_id`/`persist` implies `persistence: "overlay"` when the
 request didn't already set it.
+
+### Why the tool disables the kernel wrapper
+
+The kernel wraps every tool call in
+`asyncio.wait_for(..., timeout=timeout_seconds)` unless the `.tool.yml`
+declares `timeout_seconds: 0`, and defaults to **30 s** when the value is
+omitted. `bwrap_run` is dispatched by `bash_run` with a deliberately extended
+timeout (the sandboxed auto-background grace window — up to 3600 s), so no
+static wrapper bound can be sized to it. The 2026-10-05 shell turn lost a
+command exactly this way: the inherited 30 s wrapper cancelled `bash_run` at
+30 s, then the in-flight `bwrap_run` child at 33 s, and the orphaned task
+surfaced as "Task exception was never retrieved". `bwrap_run.tool.yml`
+therefore declares `timeout_seconds: 0` (self-bounding): its own parameter
+kills a silent child and `stream_output: true` publishes progress on
+`lisa.tool_output` while it runs. The declaration is pinned by
+`tests/test_catalog.py`.
 
 Every result carries its real posture: `sandboxed: true`, `backend`,
 `persistence`, `return_code`, `stderr`, `timed_out`, `truncated`,

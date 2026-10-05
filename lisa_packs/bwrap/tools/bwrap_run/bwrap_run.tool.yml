@@ -6,3 +6,12 @@ effect: execute
 approval_required: false
 stream_output: true
 exportable: true
+# Kernel wrapper timeout: 0 disables the wrapper (sdk/AUTHORING.md contract).
+# bwrap_run self-bounds: its own timeout_seconds parameter (1-3600s, subject to
+# the floor's timeout_ceiling_seconds) kills a silent child, streaming output
+# publishes progress on lisa.tool_output while it runs, and bash_run's
+# adoption path (the only composed caller) already grants a grace window sized
+# past the model's wait. A wrapper lifetime bound cannot be sized to that —
+# the 2026-10-05 shell turn cancelled a mid-flight child at 30s and stranded
+# the command — so the tool declares itself self-bounding.
+timeout_seconds: 0
