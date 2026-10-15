@@ -11,10 +11,28 @@ import asyncio
 import contextlib
 import os
 import signal
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 __all__ = ["ProcessResult", "run_process"]
+
+#: Environment variables the sandboxed child always receives. Everything else
+#: in the parent's environment is dropped: the host exports runtime state
+#: (``LISA_THREAD_DIR``, ``FRAMEWORK_ROOT``, ``LISA_TIMEZONE``) whose leaks
+#: make tests resolve real host paths (2026-10-15: 78 ``Errno 30`` failures
+#: under the read-only sandbox mount), and provider credentials that a
+#: networked sandbox must never see.
+_ENV_ALLOWLIST = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "HOME",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    "SHELL",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,8 +142,16 @@ async def run_process(
     max_output_bytes: int,
     log_path: object | None = None,
     on_output: Callable[[str, str], None] | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> ProcessResult:
     """Execute an explicit argument vector with bounded output and timeout.
+
+    The child environment is scrubbed to :data:`_ENV_ALLOWLIST` plus
+    ``extra_env``; the parent's ambient environment never passes through
+    (see the allowlist note for the 2026-10-15 regression background). The
+    bwrap namespace already isolates the filesystem and network axes; an
+    unscrubbed environment would re-import host state through every
+    ``os.environ`` read in the child.
 
     When ``log_path`` is provided, the full invocable argv and the retained
     stdout/stderr are appended to that log file for user-visible auditing.
@@ -139,6 +165,12 @@ async def run_process(
     if not argv or not argv[0]:
         raise ValueError("A non-empty executable argument vector is required.")
 
+    child_env = {
+        name: os.environ[name] for name in _ENV_ALLOWLIST if name in os.environ
+    }
+    if extra_env:
+        child_env.update(dict(extra_env))
+
     def _stdout_tap(line: str) -> None:
         if on_output is not None:
             on_output("stdout", line)
@@ -149,6 +181,7 @@ async def run_process(
 
     process = await asyncio.create_subprocess_exec(
         *argv,
+        env=child_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         # Own session + process group: a group kill takes the whole child

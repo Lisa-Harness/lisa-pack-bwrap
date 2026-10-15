@@ -103,3 +103,70 @@ async def test_cancellation_kills_the_whole_child_group(tmp_path: Path) -> None:
     assert await _wait_gone(grand_pid), (
         f"grandchild {grand_pid} survived the caller's cancellation."
     )
+
+
+async def _child_env_keys() -> dict[str, str]:
+    """Return the child process's env as JSON string output."""
+    result = await asyncio.wait_for(
+        run_process(
+            ["/bin/sh", "-c", "env | sort"],
+            timeout_seconds=10,
+            max_output_bytes=64_000,
+        ),
+        timeout=_RETURN_LIMIT_S,
+    )
+    assert result.return_code == 0, result.stderr
+    env: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            env[key] = value
+    return env
+
+
+@pytest.mark.asyncio
+async def test_child_env_is_scrubbed_to_the_allowlist() -> None:
+    """Ambient host secrets and state must not reach the sandboxed child.
+
+    Regression background (2026-10-15): the live host exports runtime state
+    (``LISA_THREAD_DIR``, ``FRAMEWORK_ROOT``) and provider credentials; the
+    sandboxed child inherited them wholesale. 78 harness-suite tests then
+    resolved the REAL thread dir and wrote it → ``OSError [Errno 30]`` under
+    the read-only sandbox mount, and an API key reached a networked sandbox.
+    The sandbox child gets a minimal allowlist; anything else is dropped.
+    """
+
+    monkey_env = {
+        "LISA_THREAD_DIR": "/host/leaked/threads",
+        "LISA_DATA_DIR": "/host/leaked/data",
+        "FRAMEWORK_ROOT": "/host/leaked/framework",
+        "OPENROUTER_API_KEY": "sk-leaked-credential",
+        "AWS_SECRET_ACCESS_KEY": "hunt-for-the-bison",
+    }
+    for key, value in monkey_env.items():
+        # Export into this parent so the default inheritance path picks them
+        # up; the child env check below asserts the scrub dropped each one.
+        os.environ[key] = value
+    try:
+        child_env = await _child_env_keys()
+    finally:
+        for key in monkey_env:
+            os.environ.pop(key, None)
+    for key in monkey_env:
+        assert key not in child_env, f"{key} leaked into the sandbox child env"
+    assert "PATH" in child_env, "PATH must survive the scrub for the child to work"
+
+
+@pytest.mark.asyncio
+async def test_explicit_extra_env_vars_are_forwarded() -> None:
+    """An explicitly requested non-allowlist var overrides the scrub."""
+    result = await asyncio.wait_for(
+        run_process(
+            ["/bin/sh", "-c", "printf '%s' \"$NEEDED_TOOL_VAR\""],
+            timeout_seconds=10,
+            max_output_bytes=1024,
+            extra_env={"NEEDED_TOOL_VAR": "passed-through"},
+        ),
+        timeout=_RETURN_LIMIT_S,
+    )
+    assert result.stdout == "passed-through"
