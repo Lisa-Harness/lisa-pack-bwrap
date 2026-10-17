@@ -20,6 +20,37 @@ runtime that `bash_run` composes through.
 | Operation | `layers_apply` | User-invoked write: apply a reviewed layer's captured writes to the live capture targets (honors whiteouts). |
 | Entry point | `lisa.extensions.prerequisites` | `policy.check_prerequisites` — host startup fails hard if bubblewrap is absent (no silent unsandboxed proceed). |
 | Entry point | `lisa.extensions.content_roots` | `lisa_packs.bwrap:get_content_root`. |
+| Entry point | `lisa.extensions.sandbox` | `sandbox.describe_sandbox` — this pack is the sandbox-capability implementation owner (see below). |
+
+## Sandbox capability: this pack owns the implementation, not the concept
+
+The kernel owns the sandbox *concept* — a named capability
+(`providers.capabilities.sandbox`) with a declarative floor vocabulary and
+an exclusive-merge facility (`kernel.sandbox_floor`); this pack owns the
+*bubblewrap implementation*. `sandbox.py:describe_sandbox` declares the
+ownership: the runtime resolves it like the memory capability (explicit
+session selection wins, a single registered implementation auto-owns,
+ambiguity is a load error), and the declared `validate_floor` callable is
+the single loud validator for the *merged* floor — this pack's own
+`floor_from_config` parser applied at session assembly, so a merge can
+never produce a floor the enforcer cannot parse.
+
+Other packs may contribute floor needs (dynamic paths, required postures)
+through `lisa.extensions.sandbox_floors`; the runtime merges those
+contributions exclusively onto the harness-authored floor and materializes
+the final mapping into this pack's binding configuration under
+`sandbox.floor` *before* any reader resolves it — so this pack's
+`floor_from_config` and the kernel's `project_execution_floor` (what
+composing packs like `lisa-pack-coding` verify against) see one identical
+floor. Nothing in this pack changes: it reads the floor from
+`ctx.pack_config['sandbox']['floor']` exactly as before — that mapping now
+simply carries the merged result. See the
+[pack authoring guide](../../docs/PACK_AUTHORING_GUIDE.md) for the
+contribution contract.
+
+Sessions that pin this pack without bubblewrap available (e.g. a Windows
+host) fail at startup through `check_prerequisites` — the pack never
+registers, its floor config is inert, and consumers fail closed.
 
 ## The trust model: harness floor + tighten-only overrides
 

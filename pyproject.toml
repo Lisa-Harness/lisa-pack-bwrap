@@ -36,3 +36,6 @@ bwrap = "lisa_packs.bwrap:get_content_root"
 
 [project.entry-points."lisa.extensions.prerequisites"]
 bwrap = "lisa_packs.bwrap.policy:check_prerequisites"
+
+[project.entry-points."lisa.extensions.sandbox"]
+bwrap = "lisa_packs.bwrap.sandbox:describe_sandbox"
