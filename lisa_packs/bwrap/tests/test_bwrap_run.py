@@ -59,6 +59,67 @@ async def test_invalid_layer_id_rejected(monkeypatch, tmp_path: Path) -> None:
     assert "Invalid layer_id" in result.error or "layer_id" in result.error
 
 
+@pytest.mark.asyncio
+async def test_argv_json_string_is_coerced_to_list(monkeypatch, tmp_path: Path) -> None:
+    """A JSON-encoded string for ``argv`` is accepted as a real list.
+
+    Same lenient-model fix as bash_run's ``commands`` (the 2026-10-18
+    production incident — under a JSON-mode tool schema the model emitted
+    a list-valued parameter as a STRING containing the JSON array, and
+    identical ``Input should be a valid list`` validation errors repeated
+    because nothing in the error told it why the shape was wrong).
+    """
+
+    class _Caps:
+        available = True
+        can_overlay = True
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+
+    seen: dict = {}
+
+    def _fake_run_process(argv, **kwargs):
+        seen["argv"] = list(argv)
+
+        async def _run():
+            return _OkResult()
+
+        return _run()
+
+    monkeypatch.setattr(bwrap_run, "run_process", _fake_run_process)
+    ctx = _ctx(data_dir=str(tmp_path), parameters={"argv": '["echo", "hi"]'})
+    result = await bwrap_run.execute(ctx)
+    assert result.error == ""
+    assert "echo" in seen["argv"] and "hi" in seen["argv"]
+
+
+@pytest.mark.asyncio
+async def test_argv_non_json_string_still_rejected(monkeypatch, tmp_path: Path) -> None:
+    """A plain (non-JSON) string for ``argv`` keeps the standard error."""
+
+    class _Caps:
+        available = True
+        can_overlay = True
+        bwrap_path = "/usr/bin/bwrap"
+        missing = ()
+
+    monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
+    ctx = _ctx(data_dir=str(tmp_path), parameters={"argv": "echo hi"})
+    result = await bwrap_run.execute(ctx)
+    assert result.error
+    assert "argv" in result.error
+
+
+class _OkResult:
+    return_code = 0
+    stdout = "ok\n"
+    stderr = ""
+    timed_out = False
+    output_truncated = False
+
+
 class _Result:
     return_code = 0
     stdout = "ok\n"
@@ -77,6 +138,7 @@ def _fake_run_process(argv, *, timeout_seconds, max_output_bytes, log_path=None,
 @pytest.mark.asyncio
 async def test_default_backend_is_tmpfs_not_overlay(monkeypatch, tmp_path: Path) -> None:
     """With no persist/layer_id, tmpfs is used even when overlay is available."""
+
     class _Caps:
         available = True
         can_overlay = True  # overlay IS available, but must not be default
@@ -107,10 +169,9 @@ async def test_default_backend_is_tmpfs_not_overlay(monkeypatch, tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_tmpfs_mode_binds_workspace_readonly_and_scratch(
-    monkeypatch, tmp_path: Path
-) -> None:
+async def test_tmpfs_mode_binds_workspace_readonly_and_scratch(monkeypatch, tmp_path: Path) -> None:
     """tmpfs mode must add a RO workspace bind plus a writable scratch bind."""
+
     class _Caps:
         available = True
         can_overlay = False
@@ -121,9 +182,13 @@ async def test_tmpfs_mode_binds_workspace_readonly_and_scratch(
 
     def _capture(argv, *, timeout_seconds, max_output_bytes, log_path=None, on_output=None):
         captured["argv"] = list(argv)
-        return _fake_run_process(argv, timeout_seconds=timeout_seconds,
-                                 max_output_bytes=max_output_bytes, log_path=log_path,
-                                 on_output=on_output)
+        return _fake_run_process(
+            argv,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+            log_path=log_path,
+            on_output=on_output,
+        )
 
     monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
     monkeypatch.setattr(bwrap_run, "run_process", _capture)
@@ -146,10 +211,9 @@ async def test_tmpfs_mode_binds_workspace_readonly_and_scratch(
 
 
 @pytest.mark.asyncio
-async def test_overlay_capture_targets_workspace_not_data_dir(
-    monkeypatch, tmp_path: Path
-) -> None:
+async def test_overlay_capture_targets_workspace_not_data_dir(monkeypatch, tmp_path: Path) -> None:
     """The overlay lowerdir must be the configured workspace, not ~/.lisa."""
+
     class _Caps:
         available = True
         can_overlay = True
@@ -175,6 +239,7 @@ async def test_overlay_capture_targets_workspace_not_data_dir(
 @pytest.mark.asyncio
 async def test_overlay_opt_in_when_available(monkeypatch, tmp_path: Path) -> None:
     """persist=True with overlay available uses the overlay backend."""
+
     class _Caps:
         available = True
         can_overlay = True
@@ -206,6 +271,7 @@ async def test_overlay_requested_but_unavailable_reports_degraded(
     monkeypatch, tmp_path: Path
 ) -> None:
     """Asking for overlay on a host without it degrades explicitly to tmpfs."""
+
     class _Caps:
         available = True
         can_overlay = False
@@ -225,10 +291,9 @@ async def test_overlay_requested_but_unavailable_reports_degraded(
 
 
 @pytest.mark.asyncio
-async def test_overlay_uses_launcher_chain_with_cap_drop(
-    monkeypatch, tmp_path: Path
-) -> None:
+async def test_overlay_uses_launcher_chain_with_cap_drop(monkeypatch, tmp_path: Path) -> None:
     """The overlay run wraps the bwrap argv in the unshare pre-mount chain."""
+
     class _Caps:
         available = True
         can_overlay = True
@@ -239,9 +304,13 @@ async def test_overlay_uses_launcher_chain_with_cap_drop(
 
     def _capture(argv, *, timeout_seconds, max_output_bytes, log_path=None, on_output=None):
         captured["argv"] = list(argv)
-        return _fake_run_process(argv, timeout_seconds=timeout_seconds,
-                                 max_output_bytes=max_output_bytes, log_path=log_path,
-                                 on_output=on_output)
+        return _fake_run_process(
+            argv,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+            log_path=log_path,
+            on_output=on_output,
+        )
 
     monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
     monkeypatch.setattr(bwrap_run, "run_process", _capture)
@@ -267,10 +336,9 @@ async def test_overlay_uses_launcher_chain_with_cap_drop(
 
 
 @pytest.mark.asyncio
-async def test_capture_paths_compose_extra_overlay_targets(
-    monkeypatch, tmp_path: Path
-) -> None:
+async def test_capture_paths_compose_extra_overlay_targets(monkeypatch, tmp_path: Path) -> None:
     """Requested capture paths become additional overlay targets, stamped."""
+
     class _Caps:
         available = True
         can_overlay = True
@@ -281,9 +349,13 @@ async def test_capture_paths_compose_extra_overlay_targets(
 
     def _capture(argv, *, timeout_seconds, max_output_bytes, log_path=None, on_output=None):
         captured["argv"] = list(argv)
-        return _fake_run_process(argv, timeout_seconds=timeout_seconds,
-                                 max_output_bytes=max_output_bytes, log_path=log_path,
-                                 on_output=on_output)
+        return _fake_run_process(
+            argv,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+            log_path=log_path,
+            on_output=on_output,
+        )
 
     monkeypatch.setattr(bwrap_run, "detect_capabilities", lambda probe_dir=None: _Caps())
     monkeypatch.setattr(bwrap_run, "run_process", _capture)
@@ -319,6 +391,7 @@ async def test_capture_paths_with_nonoverlay_persistence_rejected(
     monkeypatch, tmp_path: Path
 ) -> None:
     """Capture + ephemeral is a loud policy error, never a silent degrade."""
+
     class _Caps:
         available = True
         can_overlay = True
@@ -347,6 +420,7 @@ async def test_overlay_requested_but_unavailable_reports_precise_note(
     monkeypatch, tmp_path: Path
 ) -> None:
     """Asking for overlay on a host without it degrades with a precise note."""
+
     class _Caps:
         available = True
         can_overlay = False
@@ -368,6 +442,7 @@ async def test_overlay_requested_but_unavailable_reports_precise_note(
 @pytest.mark.asyncio
 async def test_overlay_blocker_note_omits_install_hint(monkeypatch, tmp_path: Path) -> None:
     """A chain-blocker cause (bwrap stage) must NOT suggest reinstalling bwrap."""
+
     class _Caps:
         available = True
         can_overlay = False

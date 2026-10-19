@@ -16,6 +16,7 @@ layers, or mounts - only the persistence posture.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import tempfile
 from collections.abc import Mapping
@@ -24,7 +25,7 @@ from typing import Any
 
 from kernel.models import ToolExecutionContext, ToolResult
 from kernel.tools.output_stream import publish_tool_output
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from lisa_packs.bwrap.argv_builder import build_bwrap_argv_for_profile
 from lisa_packs.bwrap.backends.overlay import OverlayBackend
@@ -72,10 +73,7 @@ def _identity_block() -> dict[str, Any]:
             host_user = ""
     except ImportError:
         host_user = ""
-    map_text = (
-        f"{host_user or 'host user'}({host_uid}) -> sandbox root(0) "
-        "(single-entry uid map)"
-    )
+    map_text = f"{host_user or 'host user'}({host_uid}) -> sandbox root(0) (single-entry uid map)"
     return {
         "sandbox_uid": 0,
         "sandbox_gid": 0,
@@ -104,6 +102,30 @@ class Parameters(BaseModel):
     """
 
     argv: list[str] = Field(..., min_length=1, description="Command + args to run.")
+
+    @field_validator("argv", mode="before")
+    @classmethod
+    def _accept_json_list_string(cls, value: object) -> object:
+        """Accept a JSON-encoded string for ``argv`` (lenient model fix).
+
+        Under a JSON-mode (strict=False) tool schema weaker models
+        sometimes emit a list-valued parameter as a STRING containing the
+        JSON array instead of a real array (the same 2026-10-18 bash_run
+        ``commands`` failure class: four identical ``Input should be a
+        valid list`` validation errors in one turn, with the raw JSON
+        payload as ``input_value``). Coercing a string that parses to a
+        list of strings into a real list is model-forgiving and cannot
+        mask a genuinely wrong request: a non-JSON string or a JSON
+        non-list falls through to the standard list_type error.
+        """
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return value
+            return parsed
+        return value
+
     timeout_seconds: int = Field(
         default=60,
         ge=1,
@@ -218,10 +240,7 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         # A requested layer_id / persist implies the overlay persistence
         # posture; so do requested capture paths (capture is only defined
         # under overlay - the policy join below enforces that loudly).
-        if (
-            (params.layer_id or params.persist)
-            and request.persistence is None
-        ) or (
+        if ((params.layer_id or params.persist) and request.persistence is None) or (
             request.persistence is None and "capture" in request.paths.values()
         ):
             request = SandboxProfile(
@@ -246,9 +265,7 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
     if not caps.available:
         return ToolResult(
             tool_id=TOOL_ID,
-            error=(
-                "bubblewrap sandbox is not available: " + "; ".join(caps.missing)
-            ),
+            error=("bubblewrap sandbox is not available: " + "; ".join(caps.missing)),
             output_json={
                 "sandboxed": False,
                 "missing": list(caps.missing),
@@ -267,9 +284,7 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
 
     try:
         layer_id = (
-            sanitize_layer_id(params.layer_id)
-            if params.layer_id
-            else default_layer_id(session_key)
+            sanitize_layer_id(params.layer_id) if params.layer_id else default_layer_id(session_key)
         )
     except ValueError as exc:
         return ToolResult(tool_id=TOOL_ID, error=str(exc))
@@ -299,9 +314,7 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
         # capture-posture path. The launcher (unshare --user --map-root-user
         # --mount) performs the mounts before exec'ing bwrap; bwrap only
         # binds the merged views (see OverlayBackend for the verified chain).
-        overlay = OverlayBackend(
-            layers_dir, layer_id, [capture_root, *captured_paths]
-        )
+        overlay = OverlayBackend(layers_dir, layer_id, [capture_root, *captured_paths])
         backend = overlay
         bind_args: list[str] = overlay.bind_args()
         child_argv = list(params.argv)
@@ -316,16 +329,22 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
             bind_args = ["--ro-bind", str(capture_root), str(capture_root)]
         else:
             bind_args = [
-                "--ro-bind", str(capture_root), str(capture_root),
-                "--bind", str(scratch_dir), str(scratch_dir),
+                "--ro-bind",
+                str(capture_root),
+                str(capture_root),
+                "--bind",
+                str(scratch_dir),
+                str(scratch_dir),
             ]
         child_argv = list(params.argv)
 
     if cwd is not None:
         child_argv = [
-            "/bin/sh", "-c",
-            f"cd {_sh_quote(str(cwd))} && exec \"$@\"",
-            "_", *child_argv,
+            "/bin/sh",
+            "-c",
+            f'cd {_sh_quote(str(cwd))} && exec "$@"',
+            "_",
+            *child_argv,
         ]
 
     try:
@@ -336,11 +355,7 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
             backend_bind_args=bind_args,
             drop_all_caps=use_overlay,
         )
-        argv = (
-            overlay.launcher_argv(bwrap_argv)
-            if use_overlay
-            else bwrap_argv
-        )
+        argv = overlay.launcher_argv(bwrap_argv) if use_overlay else bwrap_argv
         result = await run_process(
             argv,
             timeout_seconds=params.timeout_seconds,
@@ -459,11 +474,14 @@ def _make_scratch_dir(ctx: ToolExecutionContext, session_key: str) -> Path:
 
 def _session_key(ctx: ToolExecutionContext) -> str:
     """Stable, filesystem-safe key identifying the current conversation/session."""
-    raw = "/".join(
-        part
-        for part in (ctx.workspace_id, ctx.user_slug, ctx.session_plan_digest, ctx.surface_id)
-        if part
-    ) or "default"
+    raw = (
+        "/".join(
+            part
+            for part in (ctx.workspace_id, ctx.user_slug, ctx.session_plan_digest, ctx.surface_id)
+            if part
+        )
+        or "default"
+    )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return digest
 
@@ -524,8 +542,7 @@ def _effective_captured_paths(eff: SandboxProfile, capture_root: Path) -> list[P
         if _is_within(candidate, capture_root):
             continue  # the capture root's own overlay already covers it
         if any(
-            _is_within(candidate, existing) or _is_within(existing, candidate)
-            for existing in out
+            _is_within(candidate, existing) or _is_within(existing, candidate) for existing in out
         ):
             continue  # overlapping targets: keep the first (wider) one
         out.append(candidate)
