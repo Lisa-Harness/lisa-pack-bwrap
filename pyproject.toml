@@ -12,7 +12,7 @@ include = ["lisa_packs*", "lisa_packs.bwrap*"]
 
 [project]
 name = "lisa-pack-bwrap"
-version = "0.1.0"
+version = "0.1.1"
 description = "Bubblewrap sandbox capability for Lisa - namespace isolation with transparent overlayfs layers"
 requires-python = ">=3.11"
 dependencies = ["lisa-harness-kernel", "lisa-harness-sdk"]
