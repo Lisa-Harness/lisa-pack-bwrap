@@ -15,13 +15,20 @@ from lisa_packs.bwrap.policy import (
     resolve_effective,
 )
 
+#: Named byte/second budgets used by the floor-parsing assertions, so the
+#: expected values read as contract rather than magic numbers.
+_TMPFS_BUDGET_BYTES = 67108864
+_SMALL_TMPFS_BUDGET_BYTES = 1024
+_TIMEOUT_CEILING_SECONDS = 120
+_TIGHTENED_TMPFS_BUDGET_BYTES = 512
+
 # --- floor parsing ------------------------------------------------------------
 
 
 def test_floor_from_config_defaults_when_absent() -> None:
     assert floor_from_config({}) == default_floor()
     assert floor_from_config({"unrelated": True}) == default_floor()
-    assert floor_from_config(None) == default_floor()  # type: ignore[arg-type]
+    assert floor_from_config(None) == default_floor()
 
 
 def test_floor_from_config_parses_frozen_session_config() -> None:
@@ -40,13 +47,11 @@ def test_floor_from_config_parses_frozen_session_config() -> None:
                 "device": "dev",
                 "ipc": "shared",
                 "paths": {"/home/adam/Code": "rw"},
-                "tmpfs_budget_bytes": 67108864,
+                "tmpfs_budget_bytes": _TMPFS_BUDGET_BYTES,
             }
         }
     }
-    frozen = MappingProxyType(
-        {key: MappingProxyType(value) for key, value in authored.items()}
-    )
+    frozen = MappingProxyType({key: MappingProxyType(value) for key, value in authored.items()})
     floor = floor_from_config(frozen)
     assert floor.execution == "bare"
     assert floor.persistence == "direct-write"
@@ -54,7 +59,7 @@ def test_floor_from_config_parses_frozen_session_config() -> None:
     assert floor.device == "dev"
     assert floor.ipc == "shared"
     assert floor.paths == {"/home/adam/Code": "rw"}
-    assert floor.tmpfs_budget_bytes == 67108864
+    assert floor.tmpfs_budget_bytes == _TMPFS_BUDGET_BYTES
 
 
 def test_floor_from_config_accepts_direct_alias() -> None:
@@ -66,11 +71,7 @@ def test_floor_from_config_accepts_direct_alias() -> None:
 def test_floor_from_config_frozen_rejects_bad_value() -> None:
     """Frozen config still fails loudly on an invalid axis value."""
     frozen = MappingProxyType(
-        {
-            "sandbox": MappingProxyType(
-                {"floor": MappingProxyType({"network": "sometimes"})}
-            )
-        }
+        {"sandbox": MappingProxyType({"floor": MappingProxyType({"network": "sometimes"})})}
     )
     with pytest.raises(PolicyError):
         floor_from_config(frozen)
@@ -86,8 +87,8 @@ def test_floor_from_config_reads_trusted_values() -> None:
                 "device": "none",
                 "ipc": "unshared",
                 "paths": {"/run/log/journal": "ro", "/srv/etc": "hidden"},
-                "tmpfs_budget_bytes": 1024,
-                "timeout_ceiling_seconds": 120,
+                "tmpfs_budget_bytes": _SMALL_TMPFS_BUDGET_BYTES,
+                "timeout_ceiling_seconds": _TIMEOUT_CEILING_SECONDS,
             }
         }
     }
@@ -96,8 +97,8 @@ def test_floor_from_config_reads_trusted_values() -> None:
     assert floor.device == "none"
     assert floor.paths["/run/log/journal"] == "ro"
     assert floor.paths["/srv/etc"] == "hidden"
-    assert floor.tmpfs_budget_bytes == 1024
-    assert floor.timeout_ceiling_seconds == 120
+    assert floor.tmpfs_budget_bytes == _SMALL_TMPFS_BUDGET_BYTES
+    assert floor.timeout_ceiling_seconds == _TIMEOUT_CEILING_SECONDS
 
 
 def test_floor_from_config_rejects_unknown_axis() -> None:
@@ -127,9 +128,7 @@ def test_loosening_persistence_below_floor_rejected() -> None:
 
 
 def test_unspecified_request_rides_the_floor() -> None:
-    floor = SandboxProfile(
-        network="deny", persistence="readonly", device=None, ipc=None
-    )
+    floor = SandboxProfile(network="deny", persistence="readonly", device=None, ipc=None)
     # The request is empty: its values come from the pack safe default and are
     # then silently tightened to the floor on every floor-specified axis.
     eff = resolve_effective(floor, SandboxProfile())
@@ -144,11 +143,11 @@ def test_network_loosen_rejected() -> None:
 
 
 def test_budget_ceiling_only_tightens() -> None:
-    floor = SandboxProfile(tmpfs_budget_bytes=1024)
+    floor = SandboxProfile(tmpfs_budget_bytes=_SMALL_TMPFS_BUDGET_BYTES)
     with pytest.raises(PolicyError):
         resolve_effective(floor, SandboxProfile(tmpfs_budget_bytes=10 * 1024))
-    eff = resolve_effective(floor, SandboxProfile(tmpfs_budget_bytes=512))
-    assert eff.tmpfs_budget_bytes == 512
+    eff = resolve_effective(floor, SandboxProfile(tmpfs_budget_bytes=_TIGHTENED_TMPFS_BUDGET_BYTES))
+    assert eff.tmpfs_budget_bytes == _TIGHTENED_TMPFS_BUDGET_BYTES
 
 
 def test_per_path_floor_cannot_be_loosened() -> None:
@@ -189,7 +188,8 @@ def test_nested_path_uses_nearest_floor_permission() -> None:
         paths={"/workspace": "ro", "/workspace/worktree": "rw"},
     )
     effective = resolve_effective(
-        floor, SandboxProfile(paths={"/workspace/worktree/src": "rw"}),
+        floor,
+        SandboxProfile(paths={"/workspace/worktree/src": "rw"}),
     )
     assert effective.paths["/workspace/worktree/src"] == "rw"
 
@@ -214,9 +214,7 @@ def test_capture_ordering_between_rw_and_ro() -> None:
 def test_capture_tightens_rw_request() -> None:
     """An rw floor path joined with a capture request tightens to capture."""
     floor = SandboxProfile(persistence="overlay", paths={"/etc": "rw"})
-    eff = resolve_effective(
-        floor, SandboxProfile(persistence="overlay", paths={"/etc": "capture"})
-    )
+    eff = resolve_effective(floor, SandboxProfile(persistence="overlay", paths={"/etc": "capture"}))
     assert eff.paths["/etc"] == "capture"
 
 
@@ -248,9 +246,7 @@ def test_capture_requires_overlay_persistence() -> None:
 
 def test_capture_with_overlay_persistence_is_consistent() -> None:
     floor = SandboxProfile(persistence="overlay", paths={"/etc": "capture", "/srv": "rw"})
-    eff = resolve_effective(
-        floor, SandboxProfile(persistence="overlay", paths={"/srv": "rw"})
-    )
+    eff = resolve_effective(floor, SandboxProfile(persistence="overlay", paths={"/srv": "rw"}))
     assert eff.paths == {"/etc": "capture", "/srv": "rw"}
     assert eff.persistence == "overlay"
 

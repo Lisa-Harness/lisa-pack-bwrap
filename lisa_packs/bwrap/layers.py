@@ -17,13 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 __all__ = [
-    "LayerInfo",
     "CapturedTarget",
+    "LayerInfo",
     "captured_targets",
-    "sanitize_layer_id",
     "default_layer_id",
-    "list_layers",
     "layer_size_bytes",
+    "list_layers",
+    "sanitize_layer_id",
 ]
 
 _LAYER_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
@@ -100,9 +100,7 @@ def captured_targets(layer_path: Path) -> list[CapturedTarget]:
                 )
     legacy = layer_path / "upper"
     if legacy.is_dir() and not out:
-        out.append(
-            CapturedTarget(key="_", upper_path=str(legacy), size_bytes=_dir_size(legacy))
-        )
+        out.append(CapturedTarget(key="_", upper_path=str(legacy), size_bytes=_dir_size(legacy)))
     return out
 
 

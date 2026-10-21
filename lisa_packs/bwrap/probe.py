@@ -13,7 +13,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__all__ = ["BwrapCapabilities", "detect_capabilities", "bwrap_binary"]
+__all__ = ["BwrapCapabilities", "bwrap_binary", "detect_capabilities"]
 
 _BWRAP_BIN = "bwrap"
 
@@ -108,13 +108,30 @@ def _probe_overlay_userxattr(binary: str, probe_dir: Path) -> tuple[bool, str]:
     marker = merged / "probe.txt"  # written via the merged view by the child
     inner_argv = [
         binary,
-        "--unshare-pid", "--unshare-uts", "--unshare-ipc", "--unshare-net",
-        "--ro-bind", "/", "/",
-        "--proc", "/proc", "--dev", "/dev",
-        "--tmpfs", "/tmp",
-        "--bind", str(merged), str(merged),
-        "--die-with-parent", "--new-session", "--cap-drop", "ALL",
-        "--", "sh", "-c", f"echo probe > {marker}",
+        "--unshare-pid",
+        "--unshare-uts",
+        "--unshare-ipc",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--bind",
+        str(merged),
+        str(merged),
+        "--die-with-parent",
+        "--new-session",
+        "--cap-drop",
+        "ALL",
+        "--",
+        "sh",
+        "-c",
+        f"echo probe > {marker}",
     ]
     quoted = " ".join("'" + a.replace("'", "'\\''") + "'" for a in inner_argv)
     mount = (
@@ -125,8 +142,14 @@ def _probe_overlay_userxattr(binary: str, probe_dir: Path) -> tuple[bool, str]:
     try:
         proc = subprocess.run(
             [
-                "unshare", "--user", "--map-root-user", "--mount", "--",
-                "/bin/sh", "-c", mount,
+                "unshare",
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--",
+                "/bin/sh",
+                "-c",
+                mount,
             ],
             capture_output=True,
             timeout=15,
@@ -168,9 +191,16 @@ def _overlay_mount_works_outside_bwrap(probe_dir: Path) -> bool:
         proc = subprocess.run(
             [
                 unshare,
-                "--user", "--map-root-user", "--mount",
-                "--pid", "--fork", "--uts", "--ipc",
-                "/bin/sh", "-c", script,
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "--uts",
+                "--ipc",
+                "/bin/sh",
+                "-c",
+                script,
             ],
             capture_output=True,
             timeout=15,

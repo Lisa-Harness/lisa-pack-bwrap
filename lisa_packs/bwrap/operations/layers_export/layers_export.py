@@ -17,8 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel.models import OperationExecutionContext, OperationResult
-
-from lisa_packs.bwrap.layers import captured_targets, sanitize_layer_id
+from lisa_packs.bwrap.layers import CapturedTarget, captured_targets, sanitize_layer_id
 
 OPERATION_ID = "layers_export"
 
@@ -39,7 +38,7 @@ class _InventoryEntry:
 
 def _layers_dir(ctx: OperationExecutionContext) -> Path:
     base = Path(ctx.data_dir) if getattr(ctx, "data_dir", "") else Path.home() / ".lisa"
-    from sdk.layout import CACHE_DIR  # noqa: PLC0415
+    from sdk.layout import CACHE_DIR
 
     return base / CACHE_DIR / "layers"
 
@@ -64,9 +63,7 @@ def _inventory(upper: Path) -> list[_InventoryEntry]:
             continue
         rel = p.relative_to(upper).as_posix()
         if _is_whiteout(p):
-            entries.append(
-                _InventoryEntry(rel, 0, st.st_uid, st.st_gid, "whiteout", True)
-            )
+            entries.append(_InventoryEntry(rel, 0, st.st_uid, st.st_gid, "whiteout", True))
         elif p.is_file():
             entries.append(
                 _InventoryEntry(
@@ -105,11 +102,7 @@ def _unified_diff(live_root: Path, upper: Path, rel_path: str) -> str:
     header_a = f"live/{rel_path}" if live_exists else "/dev/null"
     header_b = f"capture/{rel_path}"
     if _is_whiteout(captured):
-        return (
-            f"--- {header_a}\n"
-            f"+++ /dev/null\n"
-            f"@@ deletion (overlayfs whiteout) of {rel_path} @@\n"
-        )
+        return f"--- {header_a}\n+++ /dev/null\n@@ deletion (overlayfs whiteout) of {rel_path} @@\n"
     if _looks_binary(captured_bytes) or _looks_binary(live_bytes):
         return (
             f"--- {header_a}\n"
@@ -126,9 +119,7 @@ def _unified_diff(live_root: Path, upper: Path, rel_path: str) -> str:
     # small config-file-sized captures this pack targets.
     import difflib
 
-    diff = difflib.unified_diff(
-        a_lines, b_lines, fromfile=header_a, tofile=header_b, lineterm=""
-    )
+    diff = difflib.unified_diff(a_lines, b_lines, fromfile=header_a, tofile=header_b, lineterm="")
     return "\n".join(diff) + "\n"
 
 
@@ -141,18 +132,132 @@ def _live_root_for_key(layer_path: Path, key: str) -> Path | None:
     capture root) has no key and is handled by the caller.
     """
     manifest = _layer_manifest(layer_path)
-    for entry in manifest.get("targets", []):
+    for entry in _manifest_targets(manifest):
         if entry.get("key") == key:
-            return Path(entry["path"])
+            return Path(str(entry["path"]))
     return None
+
+
+def _manifest_targets(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """The manifest's ``targets`` entries, skipping malformed rows."""
+    raw_targets = manifest.get("targets")
+    if not isinstance(raw_targets, list):
+        return []
+    return [entry for entry in raw_targets if isinstance(entry, dict)]
 
 
 def _layer_manifest(layer_path: Path) -> dict[str, Any]:
     """Read the layer's creation manifest if present (empty dict otherwise)."""
     try:
-        return json.loads((layer_path / "manifest.json").read_text(encoding="utf-8"))
+        raw = json.loads((layer_path / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    if not isinstance(raw, dict):
+        return {}
+    return dict(raw)
+
+
+def _diff_text_for_entry(entry: _InventoryEntry, live_root: Path | None, upper: Path) -> str:
+    """The unified diff for one captured entry, against its live target.
+
+    A whiteout renders as a deletion, a captured file with an unknown live
+    target renders as a new file, and a captured file with a known live
+    target renders as a real diff.
+    """
+    if entry.is_whiteout:
+        return _unified_diff(live_root or Path("/nonexistent"), upper, entry.rel_path)
+    if live_root is not None:
+        return _unified_diff(live_root, upper, entry.rel_path)
+    return (
+        f"--- /dev/null\n+++ capture/{entry.rel_path}\n"
+        f"@@ new file ({entry.size_bytes} bytes); live target "
+        "unknown (no manifest) @@\n"
+    )
+
+
+def _write_target_diffs(
+    target_out: Path, upper: Path, live_root: Path | None, entries: list[_InventoryEntry]
+) -> list[dict[str, Any]]:
+    """Render one target's diffs and return its inventory rows.
+
+    Diff rendering must never fail the export: a write error is swallowed and
+    the inventory row is still reported.
+    """
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        rows.append(
+            {
+                "path": entry.rel_path,
+                "size_bytes": entry.size_bytes,
+                "uid": entry.uid,
+                "gid": entry.gid,
+                "mode": entry.mode,
+                "whiteout": entry.is_whiteout,
+            }
+        )
+        if not entry.is_whiteout and entry.rel_path.endswith("/"):
+            continue
+        diff_text = _diff_text_for_entry(entry, live_root, upper)
+        diff_path = target_out / (entry.rel_path.replace("/", "__") + ".diff")
+        try:
+            diff_path.parent.mkdir(parents=True, exist_ok=True)
+            diff_path.write_text(diff_text, encoding="utf-8")
+        except OSError:
+            pass  # diff rendering must never fail the export
+    return rows
+
+
+def _export_inventory(
+    export_root: Path, layer_path: Path, targets: list[CapturedTarget]
+) -> list[dict[str, Any]]:
+    """Render every target's diffs and return the combined inventory rows."""
+    inventory: list[dict[str, Any]] = []
+    for target in targets:
+        upper = Path(target.upper_path)
+        target_out = export_root / target.key
+        target_out.mkdir(parents=True, exist_ok=True)
+        live_root = _live_root_for_key(layer_path, target.key)
+        entries = _inventory(upper)
+        for row in _write_target_diffs(target_out, upper, live_root, entries):
+            inventory.append({"target_key": target.key, **row})
+    return inventory
+
+
+def _write_export_metadata(
+    export_root: Path, layer_id: str, targets: list[CapturedTarget], inventory: list[dict[str, Any]]
+) -> None:
+    """Write the export's inventory and manifest files.
+
+    Raises:
+        OSError: The metadata could not be written.
+    """
+    (export_root / "inventory.json").write_text(json.dumps(inventory, indent=2), encoding="utf-8")
+    (export_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "layer_id": layer_id,
+                "targets": [
+                    {
+                        "key": t.key,
+                        "upper_path": t.upper_path,
+                        "size_bytes": t.size_bytes,
+                    }
+                    for t in targets
+                ],
+                "export_host_user": os.getuid(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _export_root(ctx: OperationExecutionContext, layer_id: str) -> Path:
+    """The review directory this export writes into."""
+    base = Path(ctx.data_dir) if getattr(ctx, "data_dir", "") else Path.home() / ".lisa"
+    from sdk.layout import RUN_DIR
+
+    return base / RUN_DIR / "layers-exports" / layer_id
 
 
 async def execute(ctx: OperationExecutionContext) -> OperationResult:
@@ -181,92 +286,25 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             ),
         )
 
-    base = Path(ctx.data_dir) if getattr(ctx, "data_dir", "") else Path.home() / ".lisa"
-    from sdk.layout import RUN_DIR  # noqa: PLC0415
-
-    export_root = base / RUN_DIR / "layers-exports" / layer_id
     try:
+        export_root = _export_root(ctx, layer_id)
         export_root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         return OperationResult(
             status="error",
-            output_text=f"Cannot create export directory {export_root}: {exc}",
+            output_text=f"Cannot create export directory for layer '{layer_id}': {exc}",
         )
 
-    manifest = _layer_manifest(layer_path)
-    inventory: list[dict[str, Any]] = []
-    for target in targets:
-        upper = Path(target.upper_path)
-        target_out = export_root / target.key
-        target_out.mkdir(parents=True, exist_ok=True)
-        live_root = _live_root_for_key(layer_path, target.key)
-        entries = _inventory(upper)
-        for entry in entries:
-            inventory.append(
-                {
-                    "target_key": target.key,
-                    "path": entry.rel_path,
-                    "size_bytes": entry.size_bytes,
-                    "uid": entry.uid,
-                    "gid": entry.gid,
-                    "mode": entry.mode,
-                    "whiteout": entry.is_whiteout,
-                }
-            )
-            if entry.is_whiteout or not entry.rel_path.endswith("/"):
-                if live_root is not None and not entry.is_whiteout:
-                    diff_text = _unified_diff(live_root, upper, entry.rel_path)
-                elif entry.is_whiteout:
-                    diff_text = _unified_diff(
-                        live_root or Path("/nonexistent"), upper, entry.rel_path
-                    )
-                else:
-                    diff_text = (
-                        f"--- /dev/null\n+++ capture/{entry.rel_path}\n"
-                        f"@@ new file ({entry.size_bytes} bytes); live target "
-                        "unknown (no manifest) @@\n"
-                    )
-                diff_path = target_out / (entry.rel_path.replace("/", "__") + ".diff")
-                try:
-                    diff_path.parent.mkdir(parents=True, exist_ok=True)
-                    diff_path.write_text(diff_text, encoding="utf-8")
-                except OSError:
-                    pass  # diff rendering must never fail the export
+    inventory = _export_inventory(export_root, layer_path, targets)
     try:
-        (export_root / "inventory.json").write_text(
-            json.dumps(inventory, indent=2), encoding="utf-8"
-        )
-        (export_root / "manifest.json").write_text(
-            json.dumps(
-                {
-                    "layer_id": layer_id,
-                    "targets": [
-                        {
-                            "key": t.key,
-                            "upper_path": t.upper_path,
-                            "size_bytes": t.size_bytes,
-                        }
-                        for t in targets
-                    ],
-                    "export_host_user": os.getuid(),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        _write_export_metadata(export_root, layer_id, targets, inventory)
     except OSError as exc:
         return OperationResult(
             status="degraded",
             output_text=f"Export wrote diffs but failed to write metadata: {exc}",
         )
 
-    file_count = len(
-        [
-            e
-            for e in inventory
-            if not e["whiteout"] and not e["path"].endswith("/")
-        ]
-    )
+    file_count = len([e for e in inventory if not e["whiteout"] and not e["path"].endswith("/")])
     whiteouts = len([e for e in inventory if e["whiteout"]])
     return OperationResult(
         status="success",

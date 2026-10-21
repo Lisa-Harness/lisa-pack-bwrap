@@ -16,6 +16,14 @@ from lisa_packs.bwrap.layers import (
     sanitize_layer_id,
 )
 
+#: Named byte sizes used by the layer-size assertions, so the expected
+#: values read as contract rather than magic numbers.
+_FILE_A_BYTES = 100
+_FILE_B_BYTES = 50
+_LEGACY_FILE_BYTES = 10
+_TOTAL_LAYER_BYTES = 150
+_TARGET_COUNT = 2
+
 
 def _workspace(tmp_path: Path) -> Path:
     ws = tmp_path / "ws-target"
@@ -94,7 +102,7 @@ def test_overlay_mount_commands_per_target(tmp_path: Path) -> None:
     sys_dir.mkdir()
     backend = OverlayBackend(tmp_path / "layers", "L1", [ws, sys_dir])
     commands = backend.mount_commands()
-    assert len(commands) == 2
+    assert len(commands) == _TARGET_COUNT
     assert f"overlay '{ws}'" in commands[0]
     assert f"overlay '{sys_dir}'" in commands[1]
 
@@ -157,10 +165,10 @@ def test_list_layers_tolerates_legacy_layout(tmp_path: Path) -> None:
     """Layers created before the multi-target layout still list."""
     legacy = tmp_path / "layers" / "old"
     (legacy / "upper").mkdir(parents=True)
-    (legacy / "upper" / "f").write_bytes(b"x" * 10)
+    (legacy / "upper" / "f").write_bytes(b"x" * _LEGACY_FILE_BYTES)
     layers = list_layers(tmp_path / "layers")
     assert [layer.layer_id for layer in layers] == ["old"]
-    assert layers[0].size_bytes == 10
+    assert layers[0].size_bytes == _LEGACY_FILE_BYTES
 
 
 def test_captured_targets_enumerates_per_target(tmp_path: Path) -> None:
@@ -169,15 +177,13 @@ def test_captured_targets_enumerates_per_target(tmp_path: Path) -> None:
     sys_dir.mkdir()
     backend = OverlayBackend(tmp_path / "layers", "L1", [ws, sys_dir])
     backend.ensure_layer()
-    (backend.upper_for(ws) / "a").write_bytes(b"x" * 100)
-    (backend.upper_for(sys_dir) / "b").write_bytes(b"y" * 50)
+    (backend.upper_for(ws) / "a").write_bytes(b"x" * _FILE_A_BYTES)
+    (backend.upper_for(sys_dir) / "b").write_bytes(b"y" * _FILE_B_BYTES)
     targets = captured_targets(backend.layer_path)
-    assert [t.key for t in targets] == sorted(
-        [target_key(ws), target_key(sys_dir)]
-    )
+    assert [t.key for t in targets] == sorted([target_key(ws), target_key(sys_dir)])
     sizes = {t.key: t.size_bytes for t in targets}
-    assert sizes[target_key(ws)] == 100
-    assert sizes[target_key(sys_dir)] == 50
+    assert sizes[target_key(ws)] == _FILE_A_BYTES
+    assert sizes[target_key(sys_dir)] == _FILE_B_BYTES
 
 
 def test_layer_size_bytes_sums_all_targets(tmp_path: Path) -> None:
@@ -186,6 +192,6 @@ def test_layer_size_bytes_sums_all_targets(tmp_path: Path) -> None:
     sys_dir.mkdir()
     backend = OverlayBackend(tmp_path / "layers", "sz", [ws, sys_dir])
     backend.ensure_layer()
-    (backend.upper_for(ws) / "a.txt").write_bytes(b"x" * 100)
-    (backend.upper_for(sys_dir) / "b.txt").write_bytes(b"y" * 50)
-    assert layer_size_bytes(backend.layer_path) == 150
+    (backend.upper_for(ws) / "a.txt").write_bytes(b"x" * _FILE_A_BYTES)
+    (backend.upper_for(sys_dir) / "b.txt").write_bytes(b"y" * _FILE_B_BYTES)
+    assert layer_size_bytes(backend.layer_path) == _TOTAL_LAYER_BYTES

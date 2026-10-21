@@ -2,62 +2,77 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from lisa_packs.bwrap.argv_builder import build_bwrap_argv_for_profile
 from lisa_packs.bwrap.policy import SandboxProfile
 
 
-def _build(**kwargs):
-    base = dict(
-        profile=SandboxProfile(
+def _build(**kwargs: Any) -> list[str]:
+    """Build a profile-driven bwrap argv with the default skeleton plus overrides."""
+    base: dict[str, Any] = {
+        "profile": SandboxProfile(
             execution="sandbox",
             persistence="ephemeral",
             network="deny",
             device="minimal",
             ipc="unshared",
         ),
-        child_argv=["echo", "hi"],
-    )
+        "child_argv": ["echo", "hi"],
+    }
     base.update(kwargs)
     return build_bwrap_argv_for_profile(**base)
 
 
-def test_profile_argv_starts_with_bwrap_and_child_after_separator():
+def test_profile_argv_starts_with_bwrap_and_child_after_separator() -> None:
     argv = _build()
     assert argv[0] == "bwrap"
     sep = argv.index("--")
     assert argv[sep + 1 :] == ["echo", "hi"]
 
 
-def test_deny_network_unshares_net():
+def test_deny_network_unshares_net() -> None:
     assert "--unshare-net" in _build()
 
 
-def test_allow_network_keeps_net():
+def test_allow_network_keeps_net() -> None:
     profile = SandboxProfile(
-        execution="sandbox", persistence="ephemeral", network="allow",
-        device="minimal", ipc="unshared",
+        execution="sandbox",
+        persistence="ephemeral",
+        network="allow",
+        device="minimal",
+        ipc="unshared",
     )
     argv = _build(profile=profile)
     assert "--unshare-net" not in argv
     assert "--unshare-pid" in argv
 
 
-def test_device_none_binds_dev_null_not_dev():
+def test_device_none_binds_dev_null_not_dev() -> None:
     profile = SandboxProfile(
-        execution="sandbox", persistence="ephemeral", network="deny",
-        device="none", ipc="unshared",
+        execution="sandbox",
+        persistence="ephemeral",
+        network="deny",
+        device="none",
+        ipc="unshared",
     )
     argv = _build(profile=profile)
-    assert ["--dev-bind", "/dev/null", "/dev/null"] == argv[
-        argv.index("--dev-bind") : argv.index("--dev-bind") + 3
+    assert argv[argv.index("--dev-bind") : argv.index("--dev-bind") + 3] == [
+        "--dev-bind",
+        "/dev/null",
+        "/dev/null",
     ]
     assert "--dev" not in argv
 
 
-def test_tmpfs_budget_caps_size():
+def test_tmpfs_budget_caps_size() -> None:
     profile = SandboxProfile(
-        execution="sandbox", persistence="ephemeral", network="deny",
-        device="minimal", ipc="unshared", tmpfs_budget_bytes=1024,
+        execution="sandbox",
+        persistence="ephemeral",
+        network="deny",
+        device="minimal",
+        ipc="unshared",
+        tmpfs_budget_bytes=1024,
     )
     argv = _build(profile=profile)
     size_idx = argv.index("--size")
@@ -65,18 +80,24 @@ def test_tmpfs_budget_caps_size():
     assert argv[argv.index("--tmpfs") + 1] == "/tmp"
 
 
-def test_shared_ipc_keeps_ipc_namespace_shared():
+def test_shared_ipc_keeps_ipc_namespace_shared() -> None:
     profile = SandboxProfile(
-        execution="sandbox", persistence="ephemeral", network="deny",
-        device="minimal", ipc="shared",
+        execution="sandbox",
+        persistence="ephemeral",
+        network="deny",
+        device="minimal",
+        ipc="shared",
     )
     assert "--unshare-ipc" not in _build(profile=profile)
 
 
-def test_floor_paths_bound_after_backend_binds():
+def test_floor_paths_bound_after_backend_binds() -> None:
     profile = SandboxProfile(
-        execution="sandbox", persistence="ephemeral", network="deny",
-        device="minimal", ipc="unshared",
+        execution="sandbox",
+        persistence="ephemeral",
+        network="deny",
+        device="minimal",
+        ipc="unshared",
         paths={"/run/log/journal": "ro", "/srv/safe": "rw", "/srv/hide": "hidden"},
     )
     argv = _build(
@@ -92,11 +113,14 @@ def test_floor_paths_bound_after_backend_binds():
     assert argv.index("/scratch") < argv.index("/run/log/journal")
 
 
-def test_capture_paths_not_bound_by_builder():
+def test_capture_paths_not_bound_by_builder() -> None:
     """Capture entries are backend-owned: never a plain bind from the builder."""
     profile = SandboxProfile(
-        execution="sandbox", persistence="overlay", network="deny",
-        device="minimal", ipc="unshared",
+        execution="sandbox",
+        persistence="overlay",
+        network="deny",
+        device="minimal",
+        ipc="unshared",
         paths={"/etc": "capture", "/srv/safe": "rw"},
     )
     argv = _build(
@@ -110,7 +134,7 @@ def test_capture_paths_not_bound_by_builder():
     assert len(etc_binds) == 1
 
 
-def test_drop_all_caps_emits_cap_drop():
+def test_drop_all_caps_emits_cap_drop() -> None:
     argv = _build(drop_all_caps=True)
     i = argv.index("--cap-drop")
     assert argv[i + 1] == "ALL"
@@ -119,5 +143,5 @@ def test_drop_all_caps_emits_cap_drop():
     assert argv.index("--cap-drop") < argv.index("--")
 
 
-def test_no_cap_drop_by_default():
+def test_no_cap_drop_by_default() -> None:
     assert "--cap-drop" not in _build()

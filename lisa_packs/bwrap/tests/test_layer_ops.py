@@ -7,16 +7,19 @@ export and apply it against a scratch live tree.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
-
 from kernel.models import OperationExecutionContext
 
 from lisa_packs.bwrap.backends.overlay import OverlayBackend
 from lisa_packs.bwrap.operations.layers_apply import layers_apply
 from lisa_packs.bwrap.operations.layers_export import layers_export
+
+#: Named counts used by the export assertions, so the expected values read
+#: as contract rather than magic numbers.
+_EXPECTED_TARGET_COUNT = 2
+_EXPECTED_FILE_COUNT = 3
 
 
 def _ctx(data_dir: Path, layer_id: str = "") -> OperationExecutionContext:
@@ -31,9 +34,7 @@ def _ctx(data_dir: Path, layer_id: str = "") -> OperationExecutionContext:
 
 
 def _make_layer(data_dir: Path, ws: Path, sys_dir: Path) -> OverlayBackend:
-    backend = OverlayBackend(
-        data_dir / "cache" / "layers", "L1", [ws, sys_dir]
-    )
+    backend = OverlayBackend(data_dir / "cache" / "layers", "L1", [ws, sys_dir])
     backend.ensure_layer()
     return backend
 
@@ -75,7 +76,6 @@ async def test_export_writes_diffs_inventory_and_manifest(tmp_path: Path) -> Non
     export_dir = Path(result.output_json["export_dir"])
     assert export_dir.is_dir()
     # Diffs against the LIVE tree (manifest maps keys back to ws/sys_dir).
-    diff_text = (export_dir / backend.targets[0] and export_dir / "inventory.json")
     inventory = json.loads((export_dir / "inventory.json").read_text())
     rel_paths = {e["path"] for e in inventory}
     assert "base.txt" in rel_paths
@@ -83,8 +83,8 @@ async def test_export_writes_diffs_inventory_and_manifest(tmp_path: Path) -> Non
     assert "app.conf" in rel_paths
     # Manifest records both targets and their live paths.
     manifest = json.loads((export_dir / "manifest.json").read_text())
-    assert len(manifest["targets"]) == 2
-    assert result.output_json["files"] >= 3
+    assert len(manifest["targets"]) == _EXPECTED_TARGET_COUNT
+    assert result.output_json["files"] >= _EXPECTED_FILE_COUNT
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,6 @@ import shutil
 from pathlib import Path
 
 import pytest
-
 from kernel.models import OperationExecutionContext, ToolExecutionContext
 
 from lisa_packs.bwrap.operations.layers_apply import layers_apply
@@ -19,6 +18,10 @@ from lisa_packs.bwrap.operations.layers_export import layers_export
 from lisa_packs.bwrap.tools.bwrap_run import bwrap_run
 
 pytestmark = pytest.mark.live
+
+#: Named counts used by the live export assertions, so the expected values
+#: read as contract rather than magic numbers.
+_EXPORTED_FILE_COUNT = 2
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap not installed")
@@ -71,7 +74,8 @@ async def test_bwrap_run_capture_paths_live_roundtrip(tmp_path: Path) -> None:
         pack_config={"workspace_root": str(ws)},
         parameters={
             "argv": [
-                "/bin/sh", "-c",
+                "/bin/sh",
+                "-c",
                 f"echo edited > {ws}/base.txt; "
                 f"echo port=8080 > {sys_dir}/conf/app.conf; "
                 f"echo extra >> {sys_dir}/conf/app.conf; echo done",
@@ -104,7 +108,7 @@ async def test_bwrap_run_capture_paths_live_roundtrip(tmp_path: Path) -> None:
     )
     export = await layers_export.execute(octx)
     assert export.status == "success"
-    assert export.output_json["files"] == 2
+    assert export.output_json["files"] == _EXPORTED_FILE_COUNT
     export_dir = Path(export.output_json["export_dir"])
     base_diff = next(export_dir.rglob("base.txt.diff"))
     assert "-original" in base_diff.read_text()

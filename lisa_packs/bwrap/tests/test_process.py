@@ -79,18 +79,14 @@ async def test_timeout_returns_promptly_with_a_pipe_holding_grandchild(
     assert result.timed_out
     grand_pid = int(pid_file.read_text().strip())
     # Cleanup is the fix's job now; give it a beat before asserting.
-    assert await _wait_gone(grand_pid), (
-        f"grandchild {grand_pid} still alive after return"
-    )
+    assert await _wait_gone(grand_pid), f"grandchild {grand_pid} still alive after return"
 
 
 @pytest.mark.asyncio
 async def test_cancellation_kills_the_whole_child_group(tmp_path: Path) -> None:
     pid_file = tmp_path / "grand.pid"
     argv = ["/bin/sh", "-c", _grandchild_script(pid_file)]
-    task = asyncio.ensure_future(
-        run_process(argv, timeout_seconds=60, max_output_bytes=1024)
-    )
+    task = asyncio.ensure_future(run_process(argv, timeout_seconds=60, max_output_bytes=1024))
     for _ in range(200):
         if pid_file.exists() and pid_file.read_text().strip():
             break

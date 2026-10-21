@@ -17,10 +17,9 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from kernel.models import OperationExecutionContext, OperationResult
-
 from lisa_packs.bwrap.layers import captured_targets, sanitize_layer_id
 
 OPERATION_ID = "layers_apply"
@@ -30,7 +29,7 @@ _WHITEOUT_MARKER = 0o20000  # S_IFCHR bit pattern in st_mode
 
 def _layers_dir(ctx: OperationExecutionContext) -> Path:
     base = Path(ctx.data_dir) if getattr(ctx, "data_dir", "") else Path.home() / ".lisa"
-    from sdk.layout import CACHE_DIR  # noqa: PLC0415
+    from sdk.layout import CACHE_DIR
 
     return base / CACHE_DIR / "layers"
 
@@ -44,12 +43,38 @@ def _is_whiteout(path: Path) -> bool:
 
 def _layer_manifest(layer_path: Path) -> dict[str, Any]:
     try:
-        return json.loads((layer_path / "manifest.json").read_text(encoding="utf-8"))
+        raw = json.loads((layer_path / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    if not isinstance(raw, dict):
+        return {}
+    return dict(raw)
 
 
-def _apply_target(upper: Path, live_root: Path) -> dict[str, int]:
+def _live_roots_by_key(manifest: dict[str, Any]) -> dict[str, Path]:
+    """Map each capture target's key to the live path it belongs to.
+
+    The manifest is the reverse map the overlay backend wrote at layer
+    creation; entries without a usable key/path pair are dropped so a
+    malformed manifest degrades to "unknown live target" rather than
+    pointing the merge at a bogus path.
+    """
+    raw_targets = manifest.get("targets")
+    if not isinstance(raw_targets, list):
+        return {}
+    live_by_key: dict[str, Path] = {}
+    for entry in raw_targets:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        path = entry.get("path")
+        if not key or not path:
+            continue
+        live_by_key[str(key)] = Path(str(path))
+    return live_by_key
+
+
+def _apply_target(upper: Path, live_root: Path) -> dict[str, Any]:
     """Merge one target's upper dir into its live root; returns counts."""
     copied = 0
     deleted = 0
@@ -114,11 +139,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             ),
         )
     manifest = _layer_manifest(layer_path)
-    live_by_key: dict[str, Path] = {
-        entry["key"]: Path(entry["path"])
-        for entry in manifest.get("targets", [])
-        if isinstance(entry, dict) and entry.get("key") and entry.get("path")
-    }
+    live_by_key = _live_roots_by_key(manifest)
 
     summary: list[dict[str, Any]] = []
     total_errors = 0
@@ -145,7 +166,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         total_errors += counts.get("errors", 0)
         summary.append(counts)
 
-    status = "success" if total_errors == 0 else "degraded"
+    status: Literal["success", "degraded"] = "success" if total_errors == 0 else "degraded"
     parts: list[str] = []
     for s in summary:
         if s.get("applied"):
@@ -154,9 +175,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                 f"{s.get('deleted', 0)} deleted"
             )
         else:
-            parts.append(
-                f"{s.get('target_key')}: NOT applied ({s.get('reason')})"
-            )
+            parts.append(f"{s.get('target_key')}: NOT applied ({s.get('reason')})")
     text = f"Applied layer '{layer_id}': " + "; ".join(parts)
     return OperationResult(
         status=status,
