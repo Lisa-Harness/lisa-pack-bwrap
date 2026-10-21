@@ -157,3 +157,61 @@ async def test_export_apply_roundtrip_with_whiteout(tmp_path: Path) -> None:
     assert apply_result.status == "success"
     assert not (ws / "gone.txt").exists()
     assert (ws / "keep.txt").read_text() == "kept + edited"
+
+
+# ── malformed manifest handling ───────────────────────────────────────
+
+
+def test_manifest_targets_skips_malformed_rows() -> None:
+    """A manifest row that is not a dict is skipped, not crashed on.
+
+    The manifest is written at layer creation, but it is also a file on
+    disk that a user can edit or a partial write can truncate. A row
+    that is not a dict used to raise AttributeError from ``entry.get``.
+    """
+    from lisa_packs.bwrap.operations.layers_export.layers_export import (
+        _manifest_targets,
+    )
+
+    manifest = {
+        "targets": [
+            "a bare string row",
+            {"key": "k", "path": "/tmp/live"},
+            42,
+        ]
+    }
+
+    assert _manifest_targets(manifest) == [{"key": "k", "path": "/tmp/live"}]
+
+
+def test_manifest_targets_tolerates_a_non_list() -> None:
+    """A manifest whose "targets" is not a list yields no targets."""
+    from lisa_packs.bwrap.operations.layers_export.layers_export import (
+        _manifest_targets,
+    )
+
+    assert _manifest_targets({"targets": "not a list"}) == []
+    assert _manifest_targets({}) == []
+
+
+def test_live_roots_by_key_drops_entries_without_a_usable_pair() -> None:
+    """A manifest row missing its key or path is dropped.
+
+    Pointing the merge at a bogus path would apply a layer to the wrong
+    place, so an unusable entry is discarded rather than guessed at.
+    """
+    from lisa_packs.bwrap.operations.layers_apply.layers_apply import (
+        _live_roots_by_key,
+    )
+
+    manifest = {
+        "targets": [
+            {"key": "good", "path": "/tmp/live"},
+            {"key": "no-path"},
+            {"path": "/tmp/no-key"},
+            {"key": "", "path": "/tmp/empty-key"},
+            "not a dict",
+        ]
+    }
+
+    assert _live_roots_by_key(manifest) == {"good": Path("/tmp/live")}
