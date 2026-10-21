@@ -497,8 +497,16 @@ def check_prerequisites() -> list[str]:
     contain anything and the host must not silently proceed unsandboxed.
     Side-effect-free beyond a ``shutil.which`` probe - no mounts, no execution.
     """
+    from lisa_packs.bwrap.posix_host import POSIX_HOST
     from lisa_packs.bwrap.probe import bwrap_binary
 
+    if not POSIX_HOST:
+        return [
+            "the bwrap pack implements a Linux-only sandbox (bubblewrap, "
+            "overlayfs userxattr mounts, unshare user namespaces) and cannot "
+            "run on this non-POSIX host. The pack never registers here, so "
+            "consumers fail closed instead of running unsandboxed."
+        ]
     if bwrap_binary() is None:
         return [
             "bubblewrap (bwrap) binary not found on PATH - the bwrap pack cannot "

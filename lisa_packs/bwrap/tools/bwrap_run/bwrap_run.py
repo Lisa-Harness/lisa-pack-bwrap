@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -38,6 +37,7 @@ from lisa_packs.bwrap.policy import (
     floor_from_config,
     resolve_effective,
 )
+from lisa_packs.bwrap.posix_host import host_gid, host_uid, host_user_name
 from lisa_packs.bwrap.probe import BwrapCapabilities, detect_capabilities
 from lisa_packs.bwrap.process import ProcessResult, run_process
 
@@ -62,24 +62,17 @@ def _identity_block() -> dict[str, Any]:
     display artifact, not a permissions change — we stamp it on every
     sandboxed result so the model never misreads ``ls -l`` owner columns.
     """
-    host_uid = os.getuid()
-    host_gid = os.getgid()
-    host_user = ""
-    try:  # pragma: no cover - pwd is POSIX-only; guarded for portability
-        import pwd
-
-        try:
-            host_user = pwd.getpwuid(host_uid).pw_name
-        except KeyError:
-            host_user = ""
-    except ImportError:
-        host_user = ""
-    map_text = f"{host_user or 'host user'}({host_uid}) -> sandbox root(0) (single-entry uid map)"
+    host_uid_value = host_uid()
+    host_gid_value = host_gid()
+    host_user = host_user_name(host_uid_value) if host_uid_value is not None else ""
+    map_text = (
+        f"{host_user or 'host user'}({host_uid_value}) -> sandbox root(0) (single-entry uid map)"
+    )
     return {
         "sandbox_uid": 0,
         "sandbox_gid": 0,
-        "host_uid": host_uid,
-        "host_gid": host_gid,
+        "host_uid": host_uid_value,
+        "host_gid": host_gid_value,
         "host_user": host_user,
         "map": map_text,
         "note": (

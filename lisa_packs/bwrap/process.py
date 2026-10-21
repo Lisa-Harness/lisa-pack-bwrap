@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import signal
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+
+from lisa_packs.bwrap.posix_host import kill_process_group
 
 __all__ = ["ProcessResult", "run_process"]
 
@@ -81,11 +82,8 @@ def _kill_group(process: asyncio.subprocess.Process) -> None:
     child is started in its own session (``start_new_session``), so the
     process-group kill covers its descendants.
     """
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
+    if kill_process_group(process.pid):
         return
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
     with contextlib.suppress(ProcessLookupError):
         process.kill()
 

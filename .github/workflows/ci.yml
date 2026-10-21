@@ -13,7 +13,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # This pack is a LINUX-ONLY sandbox implementation, so the matrix is
+        # Linux-only on purpose. Bubblewrap, overlayfs mounts with the
+        # `userxattr` option, and `unshare --user --map-root-user` are all
+        # Linux kernel features; macOS and Windows cannot provide the
+        # capability this pack implements, so a green job there would only
+        # prove that the code imports - not that the sandbox works.
+        #
+        # The pack's own probes already report a non-Linux host precisely
+        # (missing bwrap, missing unshare, overlay unavailable) rather than
+        # pretending to work, and the POSIX-only API surface the pack calls
+        # (`os.getuid`, `os.killpg`, `signal.SIGKILL`, `pwd.getpwuid`) lives
+        # behind the explicit boundary in `lisa_packs/bwrap/posix_host.py`.
+        os: [ubuntu-latest]
         python: ["3.11", "3.12"]
 
     steps:

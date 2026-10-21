@@ -11,13 +11,13 @@ respect to the live filesystem and the layer itself.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from kernel.models import OperationExecutionContext, OperationResult
 from lisa_packs.bwrap.layers import CapturedTarget, captured_targets, sanitize_layer_id
+from lisa_packs.bwrap.posix_host import host_uid
 
 OPERATION_ID = "layers_export"
 
@@ -244,7 +244,7 @@ def _write_export_metadata(
                     }
                     for t in targets
                 ],
-                "export_host_user": os.getuid(),
+                "export_host_user": host_uid(),
             },
             indent=2,
         ),

@@ -6,7 +6,6 @@ Skipped automatically when bwrap is not available.
 
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 
@@ -15,6 +14,7 @@ from kernel.models import OperationExecutionContext, ToolExecutionContext
 
 from lisa_packs.bwrap.operations.layers_apply import layers_apply
 from lisa_packs.bwrap.operations.layers_export import layers_export
+from lisa_packs.bwrap.posix_host import host_uid
 from lisa_packs.bwrap.tools.bwrap_run import bwrap_run
 
 pytestmark = pytest.mark.live
@@ -41,7 +41,7 @@ async def test_bwrap_run_echo_roundtrip(tmp_path: Path) -> None:
     # Real-namespace check: the identity stamp describes THIS host's mapping.
     identity = result.output_json["identity"]
     assert identity["sandbox_uid"] == 0
-    assert identity["host_uid"] == os.getuid()
+    assert identity["host_uid"] == host_uid()
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap not installed")

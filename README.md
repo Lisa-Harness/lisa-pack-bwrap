@@ -52,6 +52,38 @@ Sessions that pin this pack without bubblewrap available (e.g. a Windows
 host) fail at startup through `check_prerequisites` — the pack never
 registers, its floor config is inert, and consumers fail closed.
 
+## Supported hosts: Linux only
+
+This pack implements a **Linux-only** sandbox, and its CI matrix is
+Linux-only for the same reason. Three Linux kernel features carry the
+implementation and none of them exist elsewhere:
+
+| Feature | Used for | Available on |
+| --- | --- | --- |
+| bubblewrap (`bwrap`) | the namespace sandbox itself | Linux |
+| overlayfs with the `userxattr` option | the capture layer's upper/lower merge | Linux |
+| `unshare --user --map-root-user --mount` (util-linux) | the root-mapped user namespace that performs the overlay mounts | Linux |
+
+macOS and Windows can therefore never run this pack: there is no
+equivalent of the overlay launcher chain, and the POSIX-only APIs the pack
+calls (`os.getuid`, `os.getgid`, `pwd.getpwuid`, `os.killpg`,
+`signal.SIGKILL`) are absent on Windows. The pack states that boundary
+explicitly instead of failing accidentally:
+
+- `lisa_packs/bwrap/posix_host.py` is the single place the POSIX-only API
+  surface is reached, behind wrappers whose platform branch is explicit.
+- `check_prerequisites` names the platform boundary on a non-POSIX host
+  instead of suggesting a bubblewrap install that could never work there.
+- The capability probe already reports a missing `unshare` or a denied
+  overlay mount as the precise blocker, so a host that cannot run the
+  chain is told why rather than left to guess.
+
+The pack still *imports* and its unit tests still *pass* on macOS and
+Windows — the unit tests exercise policy, argv construction and the
+degraded-report contract, not the kernel. What the Linux-only matrix
+asserts is the thing that actually matters: that the whole gate is green on
+the platform the pack runs on.
+
 ## The trust model: harness floor + tighten-only overrides
 
 Containment is decided by the **harness floor** — the least-restrictive

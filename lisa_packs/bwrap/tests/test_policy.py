@@ -279,3 +279,18 @@ def test_check_prerequisites_empty_when_bwrap_present(
 ) -> None:
     monkeypatch.setattr("lisa_packs.bwrap.probe.bwrap_binary", lambda: "/usr/bin/bwrap")
     assert check_prerequisites() == []
+
+
+def test_check_prerequisites_reports_non_posix_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-POSIX host is named as unsupported, not probed for bubblewrap.
+
+    The pack implements a Linux-only sandbox, so the honest prerequisite
+    failure on macOS/Windows names the platform boundary instead of
+    suggesting a bubblewrap install that could never work there.
+    """
+    monkeypatch.setattr("lisa_packs.bwrap.posix_host.POSIX_HOST", False)
+    reasons = check_prerequisites()
+    assert reasons != []
+    assert "Linux-only" in reasons[0]
