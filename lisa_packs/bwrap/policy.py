@@ -38,13 +38,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from math import inf
 from pathlib import Path
 
 __all__ = [
+    "IPC",
     "Device",
     "Execution",
-    "IPC",
     "PathAccess",
     "Persistence",
     "PolicyError",
@@ -110,7 +109,7 @@ def _tighten_opt(axis: str, a: str | None, b: str | None) -> str | None:
     return _tighten(axis, a, b)
 
 
-def _tighten_budget(a: float | None, b: float | None) -> float | None:
+def _tighten_budget(a: int | None, b: int | None) -> int | None:
     """Floor budget: a tighter cap is a smaller finite number; None = unbounded."""
     if a is None and b is None:
         return None
@@ -121,7 +120,7 @@ def _tighten_budget(a: float | None, b: float | None) -> float | None:
     return min(a, b)
 
 
-def _tighten_timeout(a: float | None, b: float | None) -> float | None:
+def _tighten_timeout(a: int | None, b: int | None) -> int | None:
     """Floor timeout ceiling: only a lower ceiling tightens; None = no ceiling."""
     return _tighten_budget(a, b)
 
@@ -257,16 +256,12 @@ def resolve_effective(
     # integrity; unspecified or looser-by-default request fields ride the floor).
     eff = SandboxProfile(
         execution=_tighten_opt("execution", candidate.execution, floor.execution),
-        persistence=_tighten_opt(
-            "persistence", candidate.persistence, floor.persistence
-        ),
+        persistence=_tighten_opt("persistence", candidate.persistence, floor.persistence),
         network=_tighten_opt("network", candidate.network, floor.network),
         device=_tighten_opt("device", candidate.device, floor.device),
         ipc=_tighten_opt("ipc", candidate.ipc, floor.ipc),
         paths=_tighten_paths(candidate.paths, floor.paths),
-        tmpfs_budget_bytes=_tighten_budget(
-            candidate.tmpfs_budget_bytes, floor.tmpfs_budget_bytes
-        ),
+        tmpfs_budget_bytes=_tighten_budget(candidate.tmpfs_budget_bytes, floor.tmpfs_budget_bytes),
         timeout_ceiling_seconds=_tighten_timeout(
             candidate.timeout_ceiling_seconds, floor.timeout_ceiling_seconds
         ),
@@ -285,14 +280,11 @@ def _check_capture_consistency(profile: SandboxProfile) -> None:
     is never silently degraded - it is a loud authoring error naming the
     collision, so the user fixes the floor or the request explicitly.
     """
-    captured = [
-        path for path, access in profile.paths.items() if access == "capture"
-    ]
+    captured = [path for path, access in profile.paths.items() if access == "capture"]
     if captured and profile.persistence != "overlay":
         raise PolicyError(
             "paths[capture]",
-            f"capture on {sorted(captured)} with persistence "
-            f"{profile.persistence!r}",
+            f"capture on {sorted(captured)} with persistence {profile.persistence!r}",
             "persistence 'overlay' (capture paths require the overlay posture; "
             "request persistence 'overlay', or use rw/ro/hidden for those paths)",
         )
@@ -305,9 +297,7 @@ def _tighten_paths(
     out = dict(candidate)
     for path, floor_access in floor.items():
         cur = out.get(path)
-        out[path] = (
-            floor_access if cur is None else _tighten("paths", cur, floor_access)
-        )
+        out[path] = floor_access if cur is None else _tighten("paths", cur, floor_access)
     return out
 
 
@@ -354,34 +344,8 @@ def default_floor() -> SandboxProfile:
     )
 
 
-def floor_from_config(config: object) -> SandboxProfile:
-    """Parse the harness floor out of ``ctx.pack_config['sandbox']['floor']``.
-
-    ``config`` is the pack's pack_config mapping (trusted, harness-owned). A
-    missing/!mapping sandbox section yields the safe default floor. Unknown
-    keys and invalid values raise PolicyError - the floor is user-authored, so
-    a typo must be loud, not silently ignored.
-
-    The kernel freezes session-authored configuration into
-    ``MappingProxyType`` trees (``SessionPackConfigurationResolver._freeze``),
-    so every structural check here accepts any :class:`Mapping`, not just
-    ``dict``. A plain-dict guard would silently fall back to the shipped
-    default floor - dropping the harness's authored posture (e.g.
-    ``execution: bare``) without a word. "direct" is accepted as an alias for
-    the "direct-write" persistence value.
-    """
-    if not isinstance(config, Mapping):
-        return default_floor()
-    sandbox = config.get("sandbox")
-    if not isinstance(sandbox, Mapping):
-        return default_floor()
-    floor: object = sandbox.get("floor")
-    if floor is None:
-        return default_floor()
-    if not isinstance(floor, Mapping):
-        raise PolicyError("sandbox.floor", type(floor).__name__, "a mapping")
-
-    allowed = {
+_FLOOR_KEYS = frozenset(
+    {
         "execution",
         "persistence",
         "network",
@@ -391,13 +355,49 @@ def floor_from_config(config: object) -> SandboxProfile:
         "tmpfs_budget_bytes",
         "timeout_ceiling_seconds",
     }
-    unknown = set(floor) - allowed
+)
+
+
+def _floor_mapping(config: object) -> Mapping[str, object] | None:
+    """The authored ``sandbox.floor`` mapping, or None when none was authored.
+
+    Returns:
+        The floor mapping, or None when the config carries no usable floor
+        section (the caller then uses the shipped default floor).
+    """
+    if not isinstance(config, Mapping):
+        return None
+    sandbox = config.get("sandbox")
+    if not isinstance(sandbox, Mapping):
+        return None
+    floor: object = sandbox.get("floor")
+    if floor is None:
+        return None
+    if not isinstance(floor, Mapping):
+        raise PolicyError("sandbox.floor", type(floor).__name__, "a mapping")
+    return floor
+
+
+def _check_floor_keys(floor: Mapping[str, object]) -> None:
+    """Reject any floor key the pack does not understand.
+
+    Raises:
+        PolicyError: The floor carries a key outside :data:`_FLOOR_KEYS`.
+    """
+    unknown = set(floor) - _FLOOR_KEYS
     if unknown:
         raise PolicyError(
-            "sandbox.floor", ",".join(sorted(unknown)), f"known keys {sorted(allowed)}"
+            "sandbox.floor", ",".join(sorted(unknown)), f"known keys {sorted(_FLOOR_KEYS)}"
         )
 
-    paths: dict[str, PathAccess] = {}
+
+def _floor_paths(floor: Mapping[str, object]) -> dict[str, PathAccess]:
+    """Parse the floor's ``paths`` mapping into normalized path -> access.
+
+    Raises:
+        PolicyError: The paths node is not a mapping, or a path carries an
+            access level the pack does not know.
+    """
     raw_paths = floor.get("paths") or {}
     if not isinstance(raw_paths, Mapping):
         # A bare indented path under `paths:` in YAML parses as a plain
@@ -415,13 +415,37 @@ def floor_from_config(config: object) -> SandboxProfile:
                 "access level after it, e.g. '/some/dir: rw')",
             )
         raise PolicyError("sandbox.floor.paths", type(raw_paths).__name__, "a mapping")
+    paths: dict[str, PathAccess] = {}
     for raw_path, raw_access in raw_paths.items():
         if raw_access not in _AXES["paths"]:
             raise PolicyError(
                 f"sandbox.floor.paths[{raw_path}]", str(raw_access), "rw/capture/ro/hidden"
             )
         paths[str(_normalize_path(str(raw_path)))] = raw_access
+    return paths
 
+
+def floor_from_config(config: object) -> SandboxProfile:
+    """Parse the harness floor out of ``ctx.pack_config['sandbox']['floor']``.
+
+    ``config`` is the pack's pack_config mapping (trusted, harness-owned). A
+    missing/!mapping sandbox section yields the safe default floor. Unknown
+    keys and invalid values raise PolicyError - the floor is user-authored, so
+    a typo must be loud, not silently ignored.
+
+    The kernel freezes session-authored configuration into
+    ``MappingProxyType`` trees (``SessionPackConfigurationResolver._freeze``),
+    so every structural check here accepts any :class:`Mapping`, not just
+    ``dict``. A plain-dict guard would silently fall back to the shipped
+    default floor - dropping the harness's authored posture (e.g.
+    ``execution: bare``) without a word. "direct" is accepted as an alias for
+    the "direct-write" persistence value.
+    """
+    floor = _floor_mapping(config)
+    if floor is None:
+        return default_floor()
+    _check_floor_keys(floor)
+    paths = _floor_paths(floor)
     persistence_raw = floor.get("persistence")
     if isinstance(persistence_raw, str) and persistence_raw == "direct":
         persistence_raw = "direct-write"
@@ -473,8 +497,16 @@ def check_prerequisites() -> list[str]:
     contain anything and the host must not silently proceed unsandboxed.
     Side-effect-free beyond a ``shutil.which`` probe - no mounts, no execution.
     """
+    from lisa_packs.bwrap.posix_host import POSIX_HOST
     from lisa_packs.bwrap.probe import bwrap_binary
 
+    if not POSIX_HOST:
+        return [
+            "the bwrap pack implements a Linux-only sandbox (bubblewrap, "
+            "overlayfs userxattr mounts, unshare user namespaces) and cannot "
+            "run on this non-POSIX host. The pack never registers here, so "
+            "consumers fail closed instead of running unsandboxed."
+        ]
     if bwrap_binary() is None:
         return [
             "bubblewrap (bwrap) binary not found on PATH - the bwrap pack cannot "

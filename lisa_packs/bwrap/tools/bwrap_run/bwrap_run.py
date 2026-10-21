@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +37,9 @@ from lisa_packs.bwrap.policy import (
     floor_from_config,
     resolve_effective,
 )
-from lisa_packs.bwrap.probe import detect_capabilities
-from lisa_packs.bwrap.process import run_process
+from lisa_packs.bwrap.posix_host import host_gid, host_uid, host_user_name
+from lisa_packs.bwrap.probe import BwrapCapabilities, detect_capabilities
+from lisa_packs.bwrap.process import ProcessResult, run_process
 
 TOOL_ID = "bwrap_run"
 _MAX_OUTPUT_BYTES = 512_000
@@ -61,24 +62,17 @@ def _identity_block() -> dict[str, Any]:
     display artifact, not a permissions change — we stamp it on every
     sandboxed result so the model never misreads ``ls -l`` owner columns.
     """
-    host_uid = os.getuid()
-    host_gid = os.getgid()
-    host_user = ""
-    try:  # pragma: no cover - pwd is POSIX-only; guarded for portability
-        import pwd
-
-        try:
-            host_user = pwd.getpwuid(host_uid).pw_name
-        except KeyError:
-            host_user = ""
-    except ImportError:
-        host_user = ""
-    map_text = f"{host_user or 'host user'}({host_uid}) -> sandbox root(0) (single-entry uid map)"
+    host_uid_value = host_uid()
+    host_gid_value = host_gid()
+    host_user = host_user_name(host_uid_value) if host_uid_value is not None else ""
+    map_text = (
+        f"{host_user or 'host user'}({host_uid_value}) -> sandbox root(0) (single-entry uid map)"
+    )
     return {
         "sandbox_uid": 0,
         "sandbox_gid": 0,
-        "host_uid": host_uid,
-        "host_gid": host_gid,
+        "host_uid": host_uid_value,
+        "host_gid": host_gid_value,
         "host_user": host_user,
         "map": map_text,
         "note": (
@@ -140,7 +134,7 @@ class Parameters(BaseModel):
             "writable path override)."
         ),
     )
-    overrides: dict = Field(
+    overrides: dict[str, Any] = Field(
         default_factory=dict,
         description=(
             "Tightening overrides keyed by axis: persistence "
@@ -227,37 +221,158 @@ def _request_profile(params: Parameters) -> SandboxProfile:
     )
 
 
-async def execute(ctx: ToolExecutionContext) -> ToolResult:
-    """Run argv inside a bubblewrap sandbox shaped by the harness floor."""
-    try:
-        params = Parameters.model_validate(ctx.parameters)
-    except Exception as exc:
-        return ToolResult(tool_id=TOOL_ID, error=f"Invalid parameters: {exc}")
+@dataclass(frozen=True, slots=True)
+class _Plan:
+    """Everything one sandboxed run needs, resolved before execution.
 
+    Carries the effective profile plus the concrete paths, the backend choice
+    and the child argv, so ``execute`` stays a thin orchestration of the four
+    phases: resolve policy, plan the sandbox, run, report.
+    """
+
+    profile: SandboxProfile
+    caps: BwrapCapabilities
+    layer_id: str
+    capture_root: Path
+    scratch_dir: Path
+    captured_paths: list[Path]
+    cwd: Path | None
+    backend_name: str
+    bind_args: list[str]
+    child_argv: list[str]
+    overlay: OverlayBackend | None
+    wants_overlay: bool
+    use_overlay: bool
+
+
+def _effective_profile(ctx: ToolExecutionContext, params: Parameters) -> SandboxProfile:
+    """Join the harness floor with the model's tightening request.
+
+    Raises :class:`PolicyError` when the request asks to loosen below the
+    floor, and any other exception when the floor config itself is unusable.
+    """
+    floor = floor_from_config(ctx.pack_config)
+    request = _request_profile(params)
+    # A requested layer_id / persist implies the overlay persistence
+    # posture; so do requested capture paths (capture is only defined
+    # under overlay - the policy join below enforces that loudly).
+    if ((params.layer_id or params.persist) and request.persistence is None) or (
+        request.persistence is None and "capture" in request.paths.values()
+    ):
+        request = SandboxProfile(
+            network=request.network,
+            persistence="overlay",
+            paths=request.paths,
+        )
+    return resolve_effective(floor, request)
+
+
+def _prepare_probe_dir(layers_dir: Path) -> Path:
+    """Create the capability-probe scratch dir under the layers root.
+
+    Raises:
+        OSError: The layers dir could not be created.
+    """
+    probe_dir = layers_dir / ".probe"
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    return probe_dir
+
+
+def _resolve_layer_id(params: Parameters, session_key: str) -> str:
+    """The layer id this run captures into (explicit, else per-session).
+
+    Raises:
+        ValueError: The caller-supplied layer id is not a safe id.
+    """
+    if params.layer_id:
+        return sanitize_layer_id(params.layer_id)
+    return default_layer_id(session_key)
+
+
+def _resolve_cwd(
+    params: Parameters,
+    capture_root: Path,
+    scratch_dir: Path,
+    captured_paths: list[Path],
+) -> Path | None:
+    """The caller-set cwd, or None when it is not reachable in the namespace.
+
+    A caller-set cwd must exist inside the namespace: within the capture
+    root, under scratch, one of the extra writable binds, or a captured path.
+    """
+    if not params.cwd:
+        return None
     try:
-        floor = floor_from_config(ctx.pack_config)
-        request = _request_profile(params)
-        # A requested layer_id / persist implies the overlay persistence
-        # posture; so do requested capture paths (capture is only defined
-        # under overlay - the policy join below enforces that loudly).
-        if ((params.layer_id or params.persist) and request.persistence is None) or (
-            request.persistence is None and "capture" in request.paths.values()
-        ):
-            request = SandboxProfile(
-                network=request.network,
-                persistence="overlay",
-                paths=request.paths,
-            )
-        eff = resolve_effective(floor, request)
+        resolved_cwd = Path(params.cwd).expanduser().resolve()
+    except OSError:
+        return None
+    if _is_within(resolved_cwd, capture_root) or _is_within(resolved_cwd, scratch_dir):
+        return resolved_cwd
+    if any(_is_within(resolved_cwd, extra) for extra in params.validated_writable_paths):
+        return resolved_cwd
+    if any(_is_within(resolved_cwd, captured) for captured in captured_paths):
+        return resolved_cwd
+    return None
+
+
+def _plan_backend(
+    *,
+    profile: SandboxProfile,
+    layers_dir: Path,
+    layer_id: str,
+    capture_root: Path,
+    scratch_dir: Path,
+    captured_paths: list[Path],
+    use_overlay: bool,
+) -> tuple[str, list[str], OverlayBackend | None]:
+    """Pick the backend and the bind args for the effective posture.
+
+    Returns:
+        The backend name, the bwrap bind args, and the overlay backend when
+        the overlay posture is in force (None for the tmpfs backend).
+    """
+    if use_overlay:
+        # One overlay per capture target: the workspace capture root plus any
+        # capture-posture path. The launcher (unshare --user --map-root-user
+        # --mount) performs the mounts before exec'ing bwrap; bwrap only
+        # binds the merged views (see OverlayBackend for the verified chain).
+        overlay = OverlayBackend(layers_dir, layer_id, [capture_root, *captured_paths])
+        return overlay.name, overlay.bind_args(), overlay
+    # Give the model a WRITABLE, host-visible scratch area in tmpfs mode
+    # (persistence ephemeral): bind the real workspace read-only at its
+    # own path so the command can analyze it, plus a scratch dir it can
+    # stage a file copy in and test-apply a patch against. persistence
+    # 'readonly' binds NO writable paths at all.
+    if profile.persistence == "readonly":
+        return TmpfsBackend().name, ["--ro-bind", str(capture_root), str(capture_root)], None
+    bind_args = [
+        "--ro-bind",
+        str(capture_root),
+        str(capture_root),
+        "--bind",
+        str(scratch_dir),
+        str(scratch_dir),
+    ]
+    return TmpfsBackend().name, bind_args, None
+
+
+def _build_plan(ctx: ToolExecutionContext, params: Parameters) -> _Plan | ToolResult:
+    """Resolve policy, probe the host and plan the sandbox run.
+
+    Returns:
+        The resolved plan, or a :class:`ToolResult` carrying the error the
+        caller must report verbatim.
+    """
+    try:
+        profile = _effective_profile(ctx, params)
     except PolicyError as exc:
         return ToolResult(tool_id=TOOL_ID, error=str(exc))
-    except Exception as exc:
+    except Exception as exc:  # pylint: disable=broad-except  # a bad floor must not crash the tool
         return ToolResult(tool_id=TOOL_ID, error=f"Invalid sandbox policy: {exc}")
 
-    layers_dir = _resolve_layers_dir(ctx)
-    probe_dir = layers_dir / ".probe"
     try:
-        probe_dir.mkdir(parents=True, exist_ok=True)
+        layers_dir = _resolve_layers_dir(ctx)
+        probe_dir = _prepare_probe_dir(layers_dir)
     except OSError as exc:
         return ToolResult(tool_id=TOOL_ID, error=f"Cannot prepare layers dir: {exc}")
 
@@ -278,66 +393,28 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
     # Overlayfs is opt-in: only build a layer when the effective persistence is
     # the overlay posture. Otherwise mutations go to ephemeral tmpfs and are
     # discarded - the default.
-    wants_overlay = eff.persistence == "overlay"
+    wants_overlay = profile.persistence == "overlay"
     use_overlay = wants_overlay and caps.can_overlay
-    overlay_requested_but_unavailable = wants_overlay and not caps.can_overlay
 
     try:
-        layer_id = (
-            sanitize_layer_id(params.layer_id) if params.layer_id else default_layer_id(session_key)
-        )
+        layer_id = _resolve_layer_id(params, session_key)
     except ValueError as exc:
         return ToolResult(tool_id=TOOL_ID, error=str(exc))
 
     capture_root = _resolve_workspace_root(ctx)
     scratch_dir = _make_scratch_dir(ctx, session_key)
-    captured_paths = _effective_captured_paths(eff, capture_root)
-
-    # A caller-set cwd must exist inside the namespace: within the capture
-    # root, under scratch, one of the extra writable binds, or a captured path.
-    cwd: Path | None = None
-    if params.cwd:
-        try:
-            resolved_cwd = Path(params.cwd).expanduser().resolve()
-        except OSError:
-            resolved_cwd = None  # type: ignore[assignment]
-        if resolved_cwd is not None and (
-            _is_within(resolved_cwd, capture_root)
-            or _is_within(resolved_cwd, scratch_dir)
-            or any(_is_within(resolved_cwd, extra) for extra in params.validated_writable_paths)
-            or any(_is_within(resolved_cwd, captured) for captured in captured_paths)
-        ):
-            cwd = resolved_cwd
-
-    if use_overlay:
-        # One overlay per capture target: the workspace capture root plus any
-        # capture-posture path. The launcher (unshare --user --map-root-user
-        # --mount) performs the mounts before exec'ing bwrap; bwrap only
-        # binds the merged views (see OverlayBackend for the verified chain).
-        overlay = OverlayBackend(layers_dir, layer_id, [capture_root, *captured_paths])
-        backend = overlay
-        bind_args: list[str] = overlay.bind_args()
-        child_argv = list(params.argv)
-    else:
-        backend = TmpfsBackend()
-        # Give the model a WRITABLE, host-visible scratch area in tmpfs mode
-        # (persistence ephemeral): bind the real workspace read-only at its
-        # own path so the command can analyze it, plus a scratch dir it can
-        # stage a file copy in and test-apply a patch against. persistence
-        # 'readonly' binds NO writable paths at all.
-        if eff.persistence == "readonly":
-            bind_args = ["--ro-bind", str(capture_root), str(capture_root)]
-        else:
-            bind_args = [
-                "--ro-bind",
-                str(capture_root),
-                str(capture_root),
-                "--bind",
-                str(scratch_dir),
-                str(scratch_dir),
-            ]
-        child_argv = list(params.argv)
-
+    captured_paths = _effective_captured_paths(profile, capture_root)
+    cwd = _resolve_cwd(params, capture_root, scratch_dir, captured_paths)
+    backend_name, bind_args, overlay = _plan_backend(
+        profile=profile,
+        layers_dir=layers_dir,
+        layer_id=layer_id,
+        capture_root=capture_root,
+        scratch_dir=scratch_dir,
+        captured_paths=captured_paths,
+        use_overlay=use_overlay,
+    )
+    child_argv = list(params.argv)
     if cwd is not None:
         child_argv = [
             "/bin/sh",
@@ -346,90 +423,131 @@ async def execute(ctx: ToolExecutionContext) -> ToolResult:
             "_",
             *child_argv,
         ]
+    return _Plan(
+        profile=profile,
+        caps=caps,
+        layer_id=layer_id,
+        capture_root=capture_root,
+        scratch_dir=scratch_dir,
+        captured_paths=captured_paths,
+        cwd=cwd,
+        backend_name=backend_name,
+        bind_args=bind_args,
+        child_argv=child_argv,
+        overlay=overlay,
+        wants_overlay=wants_overlay,
+        use_overlay=use_overlay,
+    )
 
-    try:
-        bwrap_argv = build_bwrap_argv_for_profile(
-            bwrap_path=caps.bwrap_path or "bwrap",
-            profile=eff,
-            child_argv=child_argv,
-            backend_bind_args=bind_args,
-            drop_all_caps=use_overlay,
-        )
-        argv = overlay.launcher_argv(bwrap_argv) if use_overlay else bwrap_argv
-        result = await run_process(
-            argv,
-            timeout_seconds=params.timeout_seconds,
-            max_output_bytes=_MAX_OUTPUT_BYTES,
-            log_path=_session_log_path(ctx),
-            on_output=_tool_output_tap(ctx) if getattr(ctx, "stream_output", False) else None,
-        )
-    except Exception as exc:
-        return ToolResult(tool_id=TOOL_ID, error=f"bwrap_run failed: {exc}")
 
-    if use_overlay:
+async def _run_plan(ctx: ToolExecutionContext, params: Parameters, plan: _Plan) -> ProcessResult:
+    """Build the bwrap argv for the plan and run it to completion."""
+    bwrap_argv = build_bwrap_argv_for_profile(
+        bwrap_path=plan.caps.bwrap_path or "bwrap",
+        profile=plan.profile,
+        child_argv=plan.child_argv,
+        backend_bind_args=plan.bind_args,
+        drop_all_caps=plan.use_overlay,
+    )
+    argv = plan.overlay.launcher_argv(bwrap_argv) if plan.overlay is not None else bwrap_argv
+    return await run_process(
+        argv,
+        timeout_seconds=params.timeout_seconds,
+        max_output_bytes=_MAX_OUTPUT_BYTES,
+        log_path=_session_log_path(ctx),
+        on_output=_tool_output_tap(ctx) if getattr(ctx, "stream_output", False) else None,
+    )
+
+
+def _reported_persistence(params: Parameters, plan: _Plan) -> str:
+    """The persistence posture to report - the REAL one, never the requested one."""
+    if plan.use_overlay:
         # Overlay actually ran: persist controls whether the layer is retained.
-        persistence = "persistent" if params.persist else "overlay"
-    elif wants_overlay:
+        return "persistent" if params.persist else "overlay"
+    if plan.wants_overlay:
         # Overlay was requested but this host can't do it: we degraded to tmpfs,
         # so report the REAL (ephemeral) persistence, not the requested one.
-        persistence = "ephemeral"
-    else:
-        persistence = eff.persistence or "ephemeral"
+        return "ephemeral"
+    return plan.profile.persistence or "ephemeral"
 
-    output_json = {
+
+def _degraded_note(caps: BwrapCapabilities) -> str:
+    """The note explaining why an overlay request degraded to ephemeral tmpfs."""
+    reason = getattr(caps, "overlay_reason", "") or "; ".join(caps.missing)
+    if not reason.endswith("."):
+        reason += "."
+    hint = ""
+    if (
+        "bwrap drops all capabilities" not in reason
+        and "the bwrap stage is the blocker" not in reason
+    ):
+        hint = f" {_REMEDIATION_HINT}"
+    return (
+        "overlayfs capture was requested but is unavailable on this host: "
+        f"{reason} Mutations went to ephemeral tmpfs and were discarded "
+        "on exit. See sandboxing_degraded.md." + hint
+    )
+
+
+def _result_output_json(params: Parameters, plan: _Plan, result: ProcessResult) -> dict[str, Any]:
+    """Render the sandboxed result payload the model reads back."""
+    output_json: dict[str, Any] = {
         "return_code": result.return_code,
         "stderr": result.stderr,
         "sandboxed": True,
-        "backend": backend.name,
-        "persistence": persistence,
+        "backend": plan.backend_name,
+        "persistence": _reported_persistence(params, plan),
         "timed_out": result.timed_out,
         "truncated": result.output_truncated,
-        "capture_root": str(capture_root),
-        "scratch_dir": str(scratch_dir),
-        "cwd": str(cwd) if cwd is not None else "",
+        "capture_root": str(plan.capture_root),
+        "scratch_dir": str(plan.scratch_dir),
+        "cwd": str(plan.cwd) if plan.cwd is not None else "",
         "writable_paths": [str(p) for p in params.validated_writable_paths],
-        "captured_paths": [str(p) for p in captured_paths],
+        "captured_paths": [str(p) for p in plan.captured_paths],
         "identity": _identity_block(),
     }
-    if use_overlay:
-        output_json["layer_id"] = layer_id
+    if plan.use_overlay:
+        output_json["layer_id"] = plan.layer_id
         output_json["note"] = (
             "Writes are STAGED into capture layer "
-            f"'{layer_id}', not applied to the live filesystem. Relay the "
+            f"'{plan.layer_id}', not applied to the live filesystem. Relay the "
             "layer_id to the user; review/apply happens via layers_export / "
             "layers_apply (the USER applies). See layer_review.md."
         )
-    if overlay_requested_but_unavailable:
+    if plan.wants_overlay and not plan.use_overlay:
         output_json["degraded"] = True
-        output_json["missing"] = list(caps.missing)
-        reason = getattr(caps, "overlay_reason", "") or "; ".join(caps.missing)
-        if not reason.endswith("."):
-            reason += "."
-        output_json["note"] = (
-            "overlayfs capture was requested but is unavailable on this host: "
-            f"{reason} Mutations went to ephemeral tmpfs and were discarded "
-            "on exit. See sandboxing_degraded.md."
-            + (
-                ""
-                if (
-                    "bwrap drops all capabilities" in reason
-                    or "the bwrap stage is the blocker" in reason
-                )
-                else f" {_REMEDIATION_HINT}"
-            )
-        )
+        output_json["missing"] = list(plan.caps.missing)
+        output_json["note"] = _degraded_note(plan.caps)
+    return output_json
+
+
+async def execute(ctx: ToolExecutionContext) -> ToolResult:
+    """Run argv inside a bubblewrap sandbox shaped by the harness floor."""
+    try:
+        params = Parameters.model_validate(ctx.parameters)
+    except Exception as exc:  # pylint: disable=broad-except  # report bad params, never crash
+        return ToolResult(tool_id=TOOL_ID, error=f"Invalid parameters: {exc}")
+
+    plan = _build_plan(ctx, params)
+    if isinstance(plan, ToolResult):
+        return plan
+
+    try:
+        result = await _run_plan(ctx, params, plan)
+    except Exception as exc:  # pylint: disable=broad-except  # a failed sandbox is a tool error
+        return ToolResult(tool_id=TOOL_ID, error=f"bwrap_run failed: {exc}")
 
     return ToolResult(
         tool_id=TOOL_ID,
         output_text=result.stdout or f"(no output; rc={result.return_code})",
-        output_json=output_json,
+        output_json=_result_output_json(params, plan, result),
     )
 
 
 def _resolve_layers_dir(ctx: ToolExecutionContext) -> Path:
     """Resolve layer storage under the host-injected data dir."""
     base = Path(ctx.data_dir) if ctx.data_dir else Path.home() / ".lisa"
-    from sdk.layout import CACHE_DIR  # noqa: PLC0415
+    from sdk.layout import CACHE_DIR
 
     return base / CACHE_DIR / "layers"
 
@@ -461,7 +579,7 @@ def _make_scratch_dir(ctx: ToolExecutionContext, session_key: str) -> Path:
     a data_dir is available (else an ephemeral temp dir per call).
     """
     if ctx.data_dir:
-        from sdk.layout import RUN_DIR  # noqa: PLC0415
+        from sdk.layout import RUN_DIR
 
         scratch = Path(ctx.data_dir) / RUN_DIR / session_key / "scratch"
         try:
@@ -482,13 +600,12 @@ def _session_key(ctx: ToolExecutionContext) -> str:
         )
         or "default"
     )
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-    return digest
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _session_log_path(ctx: ToolExecutionContext) -> Path:
     """Per-session audit log the user can read (commands + output)."""
-    from sdk.layout import RUN_DIR  # noqa: PLC0415
+    from sdk.layout import RUN_DIR
 
     base = Path(ctx.data_dir) if ctx.data_dir else Path.home() / ".lisa"
     return base / RUN_DIR / _session_key(ctx) / f"bwrap-{_session_key(ctx)}.log"

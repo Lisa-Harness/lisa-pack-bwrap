@@ -187,10 +187,7 @@ class OverlayBackend:
                 f"upperdir={_sh_quote(str(self.upper_for(target)))},"
                 f"workdir={_sh_quote(str(self.work_for(target)))}"
             )
-            commands.append(
-                f"mount -t overlay -o {options} "
-                f"overlay {_sh_quote(str(target))}"
-            )
+            commands.append(f"mount -t overlay -o {options} overlay {_sh_quote(str(target))}")
         return commands
 
     def launcher_argv(self, bwrap_argv: list[str]) -> list[str]:
@@ -207,8 +204,14 @@ class OverlayBackend:
         inner = "\n".join(m + " || exit 1" for m in self.mount_commands())
         inner += "\nexec " + " ".join(_sh_quote(a) for a in bwrap_argv)
         return [
-            "unshare", "--user", "--map-root-user", "--mount", "--",
-            "/bin/sh", "-c", inner,
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--",
+            "/bin/sh",
+            "-c",
+            inner,
         ]
 
 

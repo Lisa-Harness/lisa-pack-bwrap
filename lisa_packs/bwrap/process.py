@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import signal
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+
+from lisa_packs.bwrap.posix_host import kill_process_group
 
 __all__ = ["ProcessResult", "run_process"]
 
@@ -81,11 +82,8 @@ def _kill_group(process: asyncio.subprocess.Process) -> None:
     child is started in its own session (``start_new_session``), so the
     process-group kill covers its descendants.
     """
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
+    if kill_process_group(process.pid):
         return
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
     with contextlib.suppress(ProcessLookupError):
         process.kill()
 
@@ -135,6 +133,67 @@ async def _drain_limited(
     return bytes(retained), overflowed
 
 
+def _child_env(extra_env: Mapping[str, str] | None) -> dict[str, str]:
+    """The scrubbed child environment: allowlist plus any explicit extras."""
+    child_env = {name: os.environ[name] for name in _ENV_ALLOWLIST if name in os.environ}
+    if extra_env:
+        child_env.update(dict(extra_env))
+    return child_env
+
+
+def _stream_tap(on_output: Callable[[str, str], None] | None, stream: str) -> Callable[[str], None]:
+    """Build the per-stream line tap that forwards to ``on_output``."""
+
+    def _tap(line: str) -> None:
+        if on_output is not None:
+            on_output(stream, line)
+
+    return _tap
+
+
+async def _await_child(
+    process: asyncio.subprocess.Process,
+    stdout_task: asyncio.Task[tuple[bytes, bool]],
+    stderr_task: asyncio.Task[tuple[bytes, bool]],
+    timeout_seconds: int,
+) -> bool:
+    """Wait for the child, killing the group on timeout.
+
+    Returns:
+        True when the child was killed on timeout, False when it exited on
+        its own.
+
+    Raises:
+        BaseException: Re-raised after the child tree and the drain tasks are
+            cleaned up (caller cancellation must never orphan them).
+    """
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+    except TimeoutError:
+        _kill_group(process)
+        await process.wait()
+        # The group is gone, so the pipes close. The drains finish on EOF;
+        # bounded one more time so no pipe quirk can wedge the caller past
+        # its deadline.
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.gather(stdout_task, stderr_task, return_exceptions=True),
+                timeout=5,
+            )
+        return True
+    except BaseException:
+        # Cancelled (e.g. the caller's tool deadline): never orphan the
+        # child tree or the drain tasks.
+        if process.returncode is None:
+            _kill_group(process)
+        stdout_task.cancel()
+        stderr_task.cancel()
+        with contextlib.suppress(BaseException):
+            await process.wait()
+        raise
+    return False
+
+
 async def run_process(
     argv: Sequence[str],
     *,
@@ -165,23 +224,9 @@ async def run_process(
     if not argv or not argv[0]:
         raise ValueError("A non-empty executable argument vector is required.")
 
-    child_env = {
-        name: os.environ[name] for name in _ENV_ALLOWLIST if name in os.environ
-    }
-    if extra_env:
-        child_env.update(dict(extra_env))
-
-    def _stdout_tap(line: str) -> None:
-        if on_output is not None:
-            on_output("stdout", line)
-
-    def _stderr_tap(line: str) -> None:
-        if on_output is not None:
-            on_output("stderr", line)
-
     process = await asyncio.create_subprocess_exec(
         *argv,
-        env=child_env,
+        env=_child_env(extra_env),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         # Own session + process group: a group kill takes the whole child
@@ -197,7 +242,7 @@ async def run_process(
         _drain_limited(
             process.stdout,
             limit=max_output_bytes,
-            on_line=_stdout_tap,
+            on_line=_stream_tap(on_output, "stdout"),
             retained_holder=stdout_holder,
         )
     )
@@ -205,35 +250,11 @@ async def run_process(
         _drain_limited(
             process.stderr,
             limit=max_output_bytes,
-            on_line=_stderr_tap,
+            on_line=_stream_tap(on_output, "stderr"),
             retained_holder=stderr_holder,
         )
     )
-    timed_out = False
-    try:
-        await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
-    except TimeoutError:
-        timed_out = True
-        _kill_group(process)
-        await process.wait()
-        # The group is gone, so the pipes close. The drains finish on EOF;
-        # bounded one more time so no pipe quirk can wedge the caller past
-        # its deadline.
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                asyncio.gather(stdout_task, stderr_task, return_exceptions=True),
-                timeout=5,
-            )
-    except BaseException:
-        # Cancelled (e.g. the caller's tool deadline): never orphan the
-        # child tree or the drain tasks.
-        if process.returncode is None:
-            _kill_group(process)
-        stdout_task.cancel()
-        stderr_task.cancel()
-        with contextlib.suppress(BaseException):
-            await process.wait()
-        raise
+    timed_out = await _await_child(process, stdout_task, stderr_task, timeout_seconds)
     stdout, stdout_overflowed = await _bounded_drain(stdout_task, stdout_holder)
     stderr, stderr_overflowed = await _bounded_drain(stderr_task, stderr_holder)
     result = ProcessResult(
@@ -262,9 +283,7 @@ def _append_log(log_path: object, argv: Sequence[str], result: ProcessResult) ->
                 if not result.stdout.endswith("\n"):
                     handle.write("\n")
             if result.stderr:
-                handle.write(
-                    "[stderr] " + result.stderr.replace("\n", "\n[stderr] ") + "\n"
-                )
+                handle.write("[stderr] " + result.stderr.replace("\n", "\n[stderr] ") + "\n")
             handle.write(f"[rc={result.return_code} timed_out={result.timed_out}]\n")
     except OSError:
         # Logging must never fail the tool call.

@@ -43,6 +43,4 @@ def test_validator_accepts_capture_paths() -> None:
     # request must then tighten to overlay). Load-time validation only
     # rejects what floor_from_config rejects: unknown keys, invalid values.
     declared = describe_sandbox()
-    declared["validate_floor"](
-        {"persistence": "ephemeral", "paths": {"/etc": "capture"}}
-    )
+    declared["validate_floor"]({"persistence": "ephemeral", "paths": {"/etc": "capture"}})
