@@ -12,6 +12,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 __all__ = ["BwrapCapabilities", "bwrap_binary", "detect_capabilities"]
 
@@ -60,8 +61,15 @@ def _userns_unprivileged_allowed() -> bool:
     return True
 
 
-def _probe_bwrap_run(binary: str) -> bool:
-    """Run a trivial namespaced command to confirm bwrap actually works."""
+def _probe_bwrap_run(binary: str) -> bool | str:
+    """Run a trivial namespaced command to confirm bwrap actually works.
+
+    Returns True on success, and a stderr-derived failure reason (never the
+    bare bool False) when the run fails, so the caller can report the actual
+    blocker instead of a generic "a namespaced run failed". A nonzero exit is
+    an expected probe answer, hence check=False: only the captured stderr is
+    the diagnosis.
+    """
     try:
         proc = subprocess.run(
             [binary, "--unshare-all", "--ro-bind", "/", "/", "--", "/bin/true"],
@@ -69,9 +77,17 @@ def _probe_bwrap_run(binary: str) -> bool:
             timeout=10,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"bwrap did not run: {exc}"
+    if proc.returncode == 0:
+        return True
+    stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+    if not stderr:
+        return f"bwrap exited {proc.returncode} with no stderr"
+    # Keep the probe's diagnosis readable: namespaced runs typically fail
+    # with one decisive line (setup deny, missing helper, seccomp policy).
+    reason = stderr.splitlines()[-1].strip()
+    return f"bwrap namespaced run failed: {reason}"
 
 
 def _probe_overlay_userxattr(binary: str, probe_dir: Path) -> tuple[bool, str]:
@@ -266,7 +282,8 @@ def detect_capabilities(*, probe_dir: Path | None = None) -> BwrapCapabilities:
     """Detect bubblewrap + overlayfs capabilities on this host.
 
     Detection is ordered and conservative: binary presence first, then a real
-    namespaced run, then (only if a probe_dir is given) a real overlay mount.
+    namespaced run (its stderr becomes the reported blocker when it fails),
+    then (only if a probe_dir is given) a real overlay mount.
     """
     missing: list[str] = []
     binary = bwrap_binary()
@@ -281,12 +298,16 @@ def detect_capabilities(*, probe_dir: Path | None = None) -> BwrapCapabilities:
         )
 
     userns = _userns_unprivileged_allowed()
-    works = _probe_bwrap_run(binary)
+    probe_result = _probe_bwrap_run(binary)
+    # mypy narrows the probe result to str here: works is only False when
+    # probe_result carried a failure reason (True short-circuits works=True).
+    works = probe_result is True
     if not works:
+        reason = cast(str, probe_result)
         if not userns:
             missing.append("unprivileged user namespaces are disabled")
         else:
-            missing.append("bwrap is present but a namespaced run failed")
+            missing.append(reason)
     overlay = False
     overlay_reason = ""
     if works and probe_dir is not None:

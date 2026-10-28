@@ -2,6 +2,25 @@
 
 All notable changes to the Lisa bwrap pack are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+#### A failed namespaced run now reports the real bwrap blocker
+
+- **What:** the capability probe captured bwrap's stderr but discarded it, so
+  a failing namespaced run degraded to the generic "bwrap is present but a
+  namespaced run failed". The probe now returns a stderr-derived reason (the
+  decisive stderr line, the exit code when stderr is empty, or the spawn
+  error itself), and `detect_capabilities` threads it verbatim into
+  `missing`, which the bwrap_run tool reports to the user.
+- **Why:** a probe answers "does this work, and why not" — a nonzero exit is
+  an expected, diagnosable answer, so the run keeps `check=False`; throwing
+  the stderr away was the only thing that turned a diagnosable failure into
+  a dead end.
+- Covered by unit tests that fail against the old code and pass on the new
+  contract (stderr-derived, empty-stderr, and spawn-failure reasons).
+
 ## [0.1.1]
 
 ### Fixed

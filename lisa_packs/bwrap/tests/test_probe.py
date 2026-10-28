@@ -152,3 +152,97 @@ def test_capabilities_carries_overlay_reason() -> None:
     assert caps.available is True
     assert caps.can_overlay is False
     assert caps.overlay_reason == "cause-y"
+
+
+class _Completed:
+    """Minimal stand-in for subprocess.CompletedProcess."""
+
+    def __init__(self, returncode: int, stderr: bytes) -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def test_probe_bwrap_run_reports_stderr_as_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nonzero-exit namespaced run yields a stderr-derived reason, not False.
+
+    The probe must keep check=False semantics (a failing run is an expected,
+    diagnosable answer) while no longer discarding the stderr that names the
+    actual blocker - detect_capabilities reports it verbatim via missing.
+    """
+
+    def _fake_run(_argv: list[str], **_kwargs: Any) -> _Completed:
+        return _Completed(1, b"bwrap: Can't find create-swap source /dev/null\n")
+
+    monkeypatch.setattr("lisa_packs.bwrap.probe.subprocess.run", _fake_run)
+    reason = probe._probe_bwrap_run("/usr/bin/bwrap")
+    assert reason == "bwrap namespaced run failed: bwrap: Can't find create-swap source /dev/null"
+
+
+def test_probe_bwrap_run_handles_spawn_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OSError from the run itself is converted to a reason, not swallowed."""
+
+    def _fake_run(_argv: list[str], **_kwargs: Any) -> Any:
+        raise OSError(8, "Exec format error")
+
+    monkeypatch.setattr("lisa_packs.bwrap.probe.subprocess.run", _fake_run)
+    reason = probe._probe_bwrap_run("/usr/bin/bwrap")
+    assert isinstance(reason, str)
+    assert "bwrap did not run" in reason
+    assert "Exec format error" in reason
+
+
+def test_probe_bwrap_run_empty_stderr_names_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nonzero exit with no stderr still reports a useful reason."""
+
+    def _fake_run(_argv: list[str], **_kwargs: Any) -> _Completed:
+        return _Completed(137, b"")
+
+    monkeypatch.setattr("lisa_packs.bwrap.probe.subprocess.run", _fake_run)
+    reason = probe._probe_bwrap_run("/usr/bin/bwrap")
+    assert reason == "bwrap exited 137 with no stderr"
+
+
+def test_detect_capabilities_carries_run_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """detect_capabilities threads the probe reason into missing verbatim."""
+
+    def _fake_run(_argv: list[str], **_kwargs: Any) -> _Completed:
+        return _Completed(1, b"bwrap: setup command failed\n")
+
+    monkeypatch.setattr("lisa_packs.bwrap.probe.subprocess.run", _fake_run)
+    # The overlay probe must not run when the namespaced run already failed.
+    monkeypatch.setattr(
+        probe,
+        "_probe_overlay_userxattr",
+        lambda _b, _d: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    caps = probe.detect_capabilities()
+    assert caps.bwrap_works is False
+    assert caps.available is False
+    assert caps.missing == ("bwrap namespaced run failed: bwrap: setup command failed",)
+
+
+def test_detect_capabilities_reports_spawn_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bwrap that cannot even exec produces the did-not-run reason."""
+
+    def _fake_run(_argv: list[str], **_kwargs: Any) -> Any:
+        raise OSError(2, "No such file or directory")
+
+    real_which = shutil.which
+    monkeypatch.setattr(
+        "lisa_packs.bwrap.probe.shutil.which",
+        lambda cmd: "/usr/bin/bwrap" if cmd == "bwrap" else real_which(cmd),
+    )
+    monkeypatch.setattr("lisa_packs.bwrap.probe.subprocess.run", _fake_run)
+    caps = probe.detect_capabilities()
+    assert caps.bwrap_works is False
+    assert any("bwrap did not run" in m for m in caps.missing)
