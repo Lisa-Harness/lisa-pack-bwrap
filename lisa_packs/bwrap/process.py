@@ -22,7 +22,8 @@ __all__ = ["ProcessResult", "run_process"]
 #: (``LISA_THREAD_DIR``, ``FRAMEWORK_ROOT``, ``LISA_TIMEZONE``) whose leaks
 #: make tests resolve real host paths (2026-10-15: 78 ``Errno 30`` failures
 #: under the read-only sandbox mount), and provider credentials that a
-#: networked sandbox must never see.
+#: networked sandbox must never see. ``TMPDIR`` is deliberately absent: the
+#: host's value is meaningless inside the namespace (see :data:`_CHILD_TMPDIR`).
 _ENV_ALLOWLIST = (
     "PATH",
     "LANG",
@@ -30,10 +31,17 @@ _ENV_ALLOWLIST = (
     "LC_CTYPE",
     "HOME",
     "TERM",
-    "TMPDIR",
     "USER",
     "SHELL",
 )
+
+#: The child temp directory. The namespace always mounts a writable ``/tmp``
+#: (``--tmpfs /tmp``, or a floor ``rw`` bind shadowing it), so the child uses
+#: that instead of inheriting the host's value: a host ``TMPDIR`` pointing
+#: outside ``/tmp`` is either masked or sits under the read-only root bind,
+#: and any child writing through it dies with ``EROFS`` (the 2026-10-15
+#: Errno-30 failure class). ``extra_env`` may still set ``TMPDIR`` explicitly.
+_CHILD_TMPDIR = "/tmp"
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,10 +142,16 @@ async def _drain_limited(
 
 
 def _child_env(extra_env: Mapping[str, str] | None) -> dict[str, str]:
-    """The scrubbed child environment: allowlist plus any explicit extras."""
+    """The scrubbed child environment: allowlist plus any explicit extras.
+
+    ``TMPDIR`` is normalized to the namespace's writable ``/tmp`` unless the
+    caller set it explicitly, so a child's temp files never resolve through
+    the host's temp path (see :data:`_CHILD_TMPDIR`).
+    """
     child_env = {name: os.environ[name] for name in _ENV_ALLOWLIST if name in os.environ}
     if extra_env:
         child_env.update(dict(extra_env))
+    child_env.setdefault("TMPDIR", _CHILD_TMPDIR)
     return child_env
 
 

@@ -154,6 +154,37 @@ async def test_child_env_is_scrubbed_to_the_allowlist() -> None:
 
 
 @pytest.mark.asyncio
+async def test_child_tmpdir_is_the_namespaced_tmp() -> None:
+    """The child temp dir must be the namespace's ``/tmp``, never the host's.
+
+    A host ``TMPDIR`` outside ``/tmp`` resolves inside the sandbox to either a
+    masked path (the ``--tmpfs /tmp`` mount) or a path under the read-only
+    root bind; a child creating temp files through it dies with ``EROFS``.
+    The scrub therefore normalizes ``TMPDIR`` to ``/tmp`` — the mount the
+    argv builder always makes writable. An explicit ``extra_env`` override
+    still wins, so a caller that prepared a real writable dir keeps control.
+    """
+
+    os.environ["TMPDIR"] = "/var/tmp/host-leak"
+    try:
+        child_env = await _child_env_keys()
+    finally:
+        os.environ.pop("TMPDIR", None)
+    assert child_env.get("TMPDIR") == "/tmp"
+
+    overridden = await asyncio.wait_for(
+        run_process(
+            ["/bin/sh", "-c", "printf '%s' \"$TMPDIR\""],
+            timeout_seconds=10,
+            max_output_bytes=64,
+            extra_env={"TMPDIR": "/scratch/prepared"},
+        ),
+        timeout=_RETURN_LIMIT_S,
+    )
+    assert overridden.stdout == "/scratch/prepared"
+
+
+@pytest.mark.asyncio
 async def test_explicit_extra_env_vars_are_forwarded() -> None:
     """An explicitly requested non-allowlist var overrides the scrub."""
     result = await asyncio.wait_for(
